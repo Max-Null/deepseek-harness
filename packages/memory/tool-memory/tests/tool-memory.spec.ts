@@ -117,4 +117,35 @@ describe('tool-memory', () => {
     const after = await execute(ctx, 'memory_list', {})
     expect(after.value).toHaveLength(0)
   })
+
+  it('presents every tool with generic render intent', async () => {
+    const { ctx } = await harness()
+
+    expect(ctx.tools.get('memory_save')?.presentCall?.({ content: 'x' }))
+      .toEqual({ card: 'generic', title: 'Save memory', kind: 'other', rawInput: 'x' })
+    expect(ctx.tools.get('memory_list')?.presentCall?.({}))
+      .toEqual({ card: 'generic', title: 'List memories', kind: 'read' })
+    expect(ctx.tools.get('memory_search')?.presentCall?.({ query: 'vue' }))
+      .toEqual({ card: 'generic', title: 'Search memory', kind: 'read', rawInput: 'vue' })
+    expect(ctx.tools.get('memory_forget')?.presentCall?.({ id: 'm1' }))
+      .toEqual({ card: 'generic', title: 'Forget memory', kind: 'other', rawInput: 'm1' })
+  })
+
+  it('executes save/list/search with the optional filters supplied and omitted', async () => {
+    const { ctx } = await harness()
+
+    const saved = await execute(ctx, 'memory_save', {
+      content: 'vue project convention',
+      namespace: 'project',
+    })
+    expect(saved.isError).toBe(false)
+
+    const listed = await execute(ctx, 'memory_list', { namespace: 'project', status: 'suggested' })
+    expect(listed.isError).toBe(false)
+    expect(listed.value).toHaveLength(1)
+
+    const searched = await execute(ctx, 'memory_search', { query: 'vue', namespace: 'project', status: 'suggested' })
+    expect(searched.isError).toBe(false)
+    expect(searched.value).toHaveLength(1)
+  })
 })

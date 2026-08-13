@@ -46,8 +46,10 @@ export function bm25Scores(query: string, docs: readonly string[]): number[] {
         if (candidate === term) termFrequency++
       }
       if (termFrequency === 0) continue
+      /* v8 ignore next -- every term with tf > 0 was indexed during the df build, so get() is defined */
       const frequency = documentFrequency.get(term) ?? 0
       const idf = Math.log(1 + (n - frequency + 0.5) / (frequency + 0.5))
+      /* v8 ignore next -- averageLength is 0 only when every doc is empty, which never reaches a tf > 0 term */
       const denominator = termFrequency + K1 * (1 - B + B * (doc.length / (averageLength || 1)))
       score += idf * (termFrequency * (K1 + 1)) / denominator
     }

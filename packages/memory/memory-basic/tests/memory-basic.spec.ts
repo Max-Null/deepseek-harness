@@ -18,8 +18,8 @@ async function setup() {
   const facility = new DomainFacility(ctx, { backend: 'json' })
   ctx.storage.mount('domain', facility)
   ctx.provide('storageDomain', facility)
-  await ctx.plugin(BasicMemoryEngine)
-  return { ctx }
+  const fiber = await ctx.plugin(BasicMemoryEngine)
+  return { ctx, fiber }
 }
 
 describe('BasicMemoryEngine', () => {
@@ -61,5 +61,36 @@ describe('BasicMemoryEngine', () => {
     expect(await ctx.memory.forget(record.id)).toBe(true)
     expect(await ctx.memory.forget(record.id)).toBe(false)
     expect(ctx.memory.list()).toEqual([])
+  })
+
+  it('list filters by status', async () => {
+    const { ctx } = await setup()
+    await ctx.memory.remember({ content: 'suggested only' })
+    const record = await ctx.memory.remember({ content: 'confirmed habit' })
+    await ctx.memory.setStatus(record.id, 'auto')
+
+    expect(ctx.memory.list({ status: 'auto' })).toHaveLength(1)
+    expect(ctx.memory.list({ status: 'suggested' })).toHaveLength(1)
+    expect(ctx.memory.list({ namespace: 'global', status: 'auto' })).toHaveLength(1)
+  })
+
+  it('search sorts multiple hits by descending score', async () => {
+    const { ctx } = await setup()
+    await ctx.memory.remember({ content: 'vue component', keywords: ['vue'] })
+    await ctx.memory.remember({ content: 'vue router and vue store', keywords: ['vue'] })
+
+    const hits = ctx.memory.search('vue')
+    expect(hits).toHaveLength(2)
+    expect(hits[0]!.score).toBeGreaterThanOrEqual(hits[1]!.score)
+  })
+
+  it('throws when used before start', () => {
+    const engine = new BasicMemoryEngine(new Context())
+    expect(() => engine.list()).toThrow('memory engine is not started yet')
+  })
+
+  it('closes the domain on dispose', async () => {
+    const { fiber } = await setup()
+    await expect(fiber.dispose()).resolves.toBeUndefined()
   })
 })
