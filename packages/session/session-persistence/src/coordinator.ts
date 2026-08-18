@@ -1187,9 +1187,15 @@ export class PersistenceCoordinator<TornMarker = unknown> {
     reservation: SessionPreparationReservation<PreparedSessionSource<TornMarker>, SessionState>,
   ): LiveSessionState {
     const { source, state } = reservation
+    // `state.cursor === source.inspection.events.length` is the binding check:
+    // the persisted seed length must match the state this reservation commits.
+    // (The historical `session.firstLiveSeq === state.cursor` guard is gone:
+    // firstLiveSeq now names the first seq appended AFTER construction, so it
+    // is `cursor` only when the seed already ended in an end-seed marker, and
+    // `cursor + 1` when the constructor appended one — it no longer encodes
+    // the seed length and cannot serve as a seed/cursor equality check.)
     if (source.session !== session || state.owner !== undefined
-      || state.cursor !== source.inspection.events.length
-      || session.firstLiveSeq !== state.cursor) {
+      || state.cursor !== source.inspection.events.length) {
       throw new Error(`session "${session.id}" preparation no longer matches its persistence state`)
     }
     const suffix = session.events.slice(state.cursor).map(event => structuredClone(event))

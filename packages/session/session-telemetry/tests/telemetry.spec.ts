@@ -295,9 +295,10 @@ describe('SessionTelemetryCoordinator adoption', () => {
 
     const seqs = backend.ledger().map(r => [r.attributes['session.id'], r.attributes['event.seq']])
     expect(seqs).toEqual(expect.arrayContaining([['seed-parent', 0], ['seed-parent', 1]]))
-    // 2 end-seed, 3 turn/end: both this lifecycle's own writes, while
-    // inherited 0-1 stay with the parent stream.
-    expect(seqs.filter(([id]) => id === 'seeded')).toEqual([['seeded', 2], ['seeded', 3]])
+    // seq 2 is the constructor's end-seed marker — a construction event that
+    // never publishes on the firehose, so adoption exports only the turn/end
+    // (seq 3) this lifecycle wrote AFTER construction.
+    expect(seqs.filter(([id]) => id === 'seeded')).toEqual([['seeded', 3]])
   })
 
   it('resume shape: a full-log seed exports only its own end-seed and rebuilds the chunk projection', async () => {
@@ -316,16 +317,17 @@ describe('SessionTelemetryCoordinator adoption', () => {
     const ofResumed = () => backend.ledger()
       .filter(r => r.attributes['session.id'] === 'resumed')
       .map(r => r.attributes['event.seq'])
-    // Nothing inherited is re-exported; seq 2 is this session's own first
-    // write — the end-seed event its constructor appended after the seed.
-    expect(ofResumed()).toEqual([2])
+    // Nothing inherited is re-exported — and neither is the end-seed marker
+    // the constructor appended at seq 2: it is a construction event that never
+    // publishes, and firstLiveSeq (the adoption start) now sits AFTER it.
+    expect(ofResumed()).toEqual([])
     // The seed fed the projection: the (turn 1, step 1) first chunk already
     // shipped from the original process, so its continuation is re-dropped…
     resumed.append('assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'continuation' } })
-    expect(ofResumed()).toEqual([2])
+    expect(ofResumed()).toEqual([])
     // …while a new step's first chunk exports normally.
     resumed.append('assistant/chunk', { turn: 1, step: 2, chunk: { type: 'text-delta', index: 0, text: 'next step' } })
-    expect(ofResumed()).toEqual([2, 4])
+    expect(ofResumed()).toEqual([4])
   })
 
   it('stamps session.seed_length from the header so receivers can stitch fork streams', async () => {

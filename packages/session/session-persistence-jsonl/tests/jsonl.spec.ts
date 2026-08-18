@@ -1010,6 +1010,59 @@ describe('JsonlSessionPersistence: scanLog unit', () => {
     const { events } = scanLog(Buffer.from(log))
     expect(events.map(e => e.seq)).toEqual([0, 1]) // tail dropped
   })
+
+  it('heals a seq restart immediately after session/end-seed (mechanism #10 resume overlap)', () => {
+    // A session whose resume seed was shorter than the persisted tail re-emits
+    // seqs that overlap the persisted live segment. The segment AFTER the
+    // end-seed marker is contiguous on its own, so the scanner restarts the
+    // strict expected counter at that boundary and heals the log without
+    // rewriting it (per-region validation, see #3198).
+    const log = [
+      JSON.stringify({ type: 'session', version: 0, id: 'heal', createdAt: 1, delegationDepth: 0 }),
+      JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }),
+      JSON.stringify({ type: 'step/start', seq: 1, time: 2, data: { turn: 1, step: 1 } }),
+      JSON.stringify({ type: 'step/end', seq: 2, time: 3, data: { turn: 1, step: 1 } }),
+      JSON.stringify({ type: 'turn/end', seq: 3, time: 4, data: { turn: 1, reason: { kind: 'interrupted' } } }),
+      JSON.stringify({ type: 'session/end-seed', seq: 4, time: 5, data: {} }),
+      // The resumed live segment re-starts at seq 1 (its short seed's length)
+      // and is contiguous from there.
+      JSON.stringify({ type: 'turn/start', seq: 1, time: 6, data: { turn: 1 } }),
+      JSON.stringify({ type: 'user/message', seq: 2, time: 7, data: { content: [], source: { kind: 'user' } } }),
+      JSON.stringify({ type: 'assistant/message', seq: 3, time: 8, data: { turn: 1, step: 1, content: [] }, surfaceOp: 'append' }),
+      JSON.stringify({ type: 'turn/end', seq: 4, time: 9, data: { turn: 1, reason: { kind: 'completed' } } }),
+    ].join('\n') + '\n'
+    const scanned = scanLog(Buffer.from(log))
+    expect(scanned.events.map(e => e.seq)).toEqual([0, 1, 2, 3, 4, 1, 2, 3, 4])
+  })
+
+  it('still rejects a seq gap INSIDE the segment after a healed end-seed restart', () => {
+    // Healing only restarts the counter AT the end-seed boundary; once the new
+    // segment is running, a second break is whole-file corruption again.
+    const log = [
+      JSON.stringify({ type: 'session', version: 0, id: 'heal2', createdAt: 1, delegationDepth: 0 }),
+      JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }),
+      JSON.stringify({ type: 'turn/end', seq: 1, time: 2, data: { turn: 1, reason: { kind: 'completed' } } }),
+      JSON.stringify({ type: 'session/end-seed', seq: 2, time: 3, data: {} }),
+      JSON.stringify({ type: 'step/start', seq: 1, time: 4, data: { turn: 2, step: 1 } }), // heal: restart at 1
+      JSON.stringify({ type: 'step/start', seq: 3, time: 5, data: { turn: 2, step: 2 } }), // gap: expected 2
+      JSON.stringify({ type: 'turn/end', seq: 4, time: 6, data: { turn: 2, reason: { kind: 'completed' } } }),
+    ].join('\n') + '\n'
+    expect(() => scanLog(Buffer.from(log))).toThrow(/seq gap in committed region/)
+  })
+
+  it('still rejects a seq gap BEFORE any end-seed boundary (strict seed segment)', () => {
+    // A break in the seed segment (no end-seed marker immediately before it)
+    // remains whole-file corruption — healing must not weaken the strict check.
+    const log = [
+      JSON.stringify({ type: 'session', version: 0, id: 'strict', createdAt: 1, delegationDepth: 0 }),
+      JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }),
+      JSON.stringify({ type: 'step/start', seq: 2, time: 2, data: { turn: 1, step: 1 } }), // gap: missing seq 1
+      JSON.stringify({ type: 'turn/end', seq: 3, time: 3, data: { turn: 1, reason: { kind: 'completed' } } }),
+      JSON.stringify({ type: 'session/end-seed', seq: 4, time: 4, data: {} }),
+      JSON.stringify({ type: 'step/start', seq: 5, time: 5, data: { turn: 2, step: 1 } }),
+    ].join('\n') + '\n'
+    expect(() => scanLog(Buffer.from(log))).toThrow(/seq gap in committed region/)
+  })
 })
 
 describe('JsonlSessionPersistence: default packed chunk rows', () => {

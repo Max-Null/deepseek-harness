@@ -448,22 +448,24 @@ export class Session {
   }
 
   /**
-   * The first seq appended IN THIS PROCESS: the length of the constructor
-   * seed (0 without one). Events with smaller seq values entered through
-   * construction — replay, fork, or resume — and were never published on the
-   * `session/event` firehose (constructor seeds do not emit), so consumers
-   * that replay the log as a publication substitute (telemetry adoption)
-   * start here. Distinct from `header.seedLength`, the DURABLE fork-lineage
-   * boundary: a resumed session's constructor seed is its full stored log,
-   * while its header keeps the original fork value — this field is the
-   * in-process construction fact.
+   * The first seq appended AFTER construction: the constructor seed length
+   * plus one when construction appended the end-seed marker (0 for a
+   * markerless seed — the fresh-session case). Events at or below this value
+   * entered through construction — replay, fork, or resume — and were never
+   * published on the `session/event` firehose (constructor seeds do not
+   * emit), so consumers that replay the log as a publication substitute
+   * (telemetry adoption) start here. Distinct from `header.seedLength`, the
+   * DURABLE fork-lineage boundary: a resumed session's constructor seed is
+   * its full stored log, while its header keeps the original fork value —
+   * this field is the in-process construction fact.
    *
    * Not persisted itself: a seeded session projects it into the log as the
    * `session/end-seed` event, which is what a consumer reading STORED history
-   * reads. Locate the LAST such event, not necessarily one at this seq — a
-   * seed already ending in one is not re-marked, so reopening an untouched
-   * session leaves that event at a smaller seq than `firstLiveSeq`. Prefer
-   * this field in-process: it is exact before the marker reaches storage.
+   * reads. The marker sits exactly at `firstLiveSeq - 1`: a seed already
+   * ending in one is not re-marked (its last event IS that marker), and a
+   * seed ending otherwise receives the marker as the first construction
+   * append — either way the marker is the last construction-owned event and
+   * every later event is a live write.
    *
    * When this lifecycle appends the marker, it occupies this seq before the
    * store attaches and therefore does not publish either. Otherwise this seq
@@ -536,7 +538,6 @@ export class Session {
         this.log.push(mode === 'restore' ? freezeRestoredObject(snapshot) : deepFreeze(snapshot))
       }
     }
-    this.firstLiveSeq = this.log.length
     this.header = restoredHeader ?? snapshotSessionHeader(id, header)
     // Appended here so the marker is already in `events` when a backend
     // captures the creation seed: no load-time write. Re-marking is skipped
@@ -545,6 +546,14 @@ export class Session {
     if (seed !== undefined && this.log.at(-1)?.type !== 'session/end-seed') {
       this.append('session/end-seed', {})
     }
+    // The FIRST LIVE seq must be captured AFTER the constructor's end-seed
+    // marker: it names the seq of the first event appended outside
+    // construction, never the marker itself (a construction boundary, not a
+    // live write). Capturing before the append made the in-memory boundary
+    // disagree with the seed a backend persists, so a resume whose seed ended
+    // on a non-marker tail could re-emit seqs that overlap the persisted tail
+    // (session-corruption family mechanism #10, deepseek-harness#3198).
+    this.firstLiveSeq = this.log.length
   }
 
   /** Cached immutable public snapshot of the private append-only log. */

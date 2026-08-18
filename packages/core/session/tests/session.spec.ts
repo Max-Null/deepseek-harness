@@ -137,7 +137,8 @@ describe('Session', () => {
     // The seed verbatim, plus the end-seed event the constructor appends.
     expect(replayed.events.slice(0, original.seq)).toEqual(original.events)
     expect(replayed.seq).toBe(original.seq + 1)
-    expect(replayed.firstLiveSeq).toBe(original.seq)
+    // firstLiveSeq names the FIRST LIVE seq: the seed length plus the marker.
+    expect(replayed.firstLiveSeq).toBe(original.seq + 1)
   })
 
   it('marks an explicitly empty seed without marking a fresh session', () => {
@@ -145,7 +146,7 @@ describe('Session', () => {
     expect(fresh.events).toEqual([])
 
     const resumed = Session.create(SessionId('resumed-empty'), [])
-    expect(resumed.firstLiveSeq).toBe(0)
+    expect(resumed.firstLiveSeq).toBe(1)
     expect(resumed.events).toMatchObject([
       { type: 'session/end-seed', seq: 0, data: {} },
     ])
@@ -557,7 +558,7 @@ describe('Session', () => {
     ] as SessionEvent[]
     const session = Session.create(SessionId('seed-ok'), goodSeed)
     expect(session.events.slice(0, 3)).toEqual(goodSeed)
-    expect(session.firstLiveSeq).toBe(3)
+    expect(session.firstLiveSeq).toBe(4)
   })
 
   it('reads each seed array entry once so validation and storage use the same event', () => {
@@ -1725,6 +1726,6 @@ describe('todo/write event', () => {
     expect(replayed.events.findLast(e => e.type === 'todo/write')!.data.todos)
       .toEqual([{ content: 'only', status: 'completed' }])
     expect(replayed.events.slice(0, original.seq)).toEqual(original.events)
-    expect(replayed.firstLiveSeq).toBe(original.seq)
+    expect(replayed.firstLiveSeq).toBe(original.seq + 1)
   })
 })

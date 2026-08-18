@@ -665,7 +665,7 @@ describe('the session-persistence Agent Note: AgentLoop factory create/resume', 
     expect(a2.session.id).toBe('sess-resume')
     // …followed by one end-seed event marking the constructor seed.
     expect(a2.session.events.length).toBe(events1.length + 1)
-    expect(a2.session.firstLiveSeq).toBe(events1.length)
+    expect(a2.session.firstLiveSeq).toBe(events1.length + 1)
     expect(a2.session.events.at(-1)?.type).toBe('session/end-seed')
     const replay = Session.create(SessionId('replay'), events1)
     expect(a2.session.deriveMessages()).toEqual(replay.deriveMessages())

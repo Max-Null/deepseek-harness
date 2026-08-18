@@ -173,7 +173,7 @@ describe('SessionStore.fork', () => {
     const boundary = child.events.at(-1)
     expect(boundary).toMatchObject({ type: 'session/end-seed' })
     expect(boundary!.seq).toBeGreaterThan(open.seq)
-    expect(child.firstLiveSeq).toBe(open.seq + 1)
+    expect(child.firstLiveSeq).toBe(open.seq + 2)
     expect(inherited(child).at(-1)).toMatchObject({ type: 'test/bracket-open', data: { id: 'op-1' } })
   })
 

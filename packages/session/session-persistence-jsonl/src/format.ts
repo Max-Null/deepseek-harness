@@ -279,6 +279,14 @@ export class SessionLogScanner {
   private eventLine = 0
   private issue: Error | undefined
   private finished = false
+  /**
+   * Next expected seq within the current segment. Equal to `events.length` for
+   * a strictly contiguous log; a healed segment restart (a seq break right
+   * after `session/end-seed`, see {@link consumeEventLine}) re-origins this
+   * counter at the break while `events` keeps every accepted event — the two
+   * intentionally diverge while seqs overlap across the seed boundary.
+   */
+  private expectedSeq = 0
 
   /**
    * Create an event scanner from exactly one newline-terminated header record.
@@ -360,9 +368,32 @@ export class SessionLogScanner {
     }
 
     const rowStart = this.events.length
+    // Healing boundary (session-corruption family mechanism #10, #3198): a
+    // `session/end-seed` marker is a construction boundary — everything before
+    // it is the seed segment, everything after is the live segment. A resume
+    // whose seed was shorter than the persisted tail (a view that excluded the
+    // repaired tail) re-emitted seqs that overlap the persisted live segment;
+    // that live segment is still contiguous on its own. So a seq break
+    // immediately following an end-seed marker starts a NEW segment: the break
+    // itself becomes the segment's origin and contiguity is enforced strictly
+    // within it (the expected counter re-origins at the break, so overlapping
+    // seqs across the boundary are the healed shape, not corruption). Breaks
+    // NOT preceded by an end-seed marker remain whole-file corruption. This
+    // heals existing logs without rewriting them while keeping the strict
+    // per-segment check (same validate-per-region principle as the per-artifact
+    // quarantine elsewhere).
+    let healing = this.events.at(-1)?.type === 'session/end-seed'
     for (const event of decoded) {
-      if (event.seq !== this.events.length) {
-        const expected = this.events.length
+      if (event.seq !== this.expectedSeq) {
+        if (healing) {
+          // New live segment: restart the expected counter at this event and
+          // enforce strict contiguity from here on.
+          healing = false
+          this.expectedSeq = event.seq + 1
+          this.events.push(event)
+          continue
+        }
+        const expected = this.expectedSeq
         this.events.length = rowStart
         this.issue = new Error(
           `corrupt session log: seq gap in committed region at line ${this.eventLine} `
@@ -371,6 +402,7 @@ export class SessionLogScanner {
         if (decoded.some(candidate => candidate.type === 'turn/end')) throw this.issue
         return
       }
+      this.expectedSeq += 1
       this.events.push(event)
     }
     this.committedBytes = endByte

@@ -152,7 +152,7 @@ describe('in-process policy inheritance', () => {
       const child = run.localAgent as Agent
 
       expect(child.session.header.seedLength).toBe(1)
-      expect(child.session.firstLiveSeq).toBe(seed.length)
+      expect(child.session.firstLiveSeq).toBe(seed.length + 1)
       // seq 1 is the constructor's end-seed marker.
       expect(child.session.events.filter(event => event.type === 'sandbox/mode')).toMatchObject([
         { seq: 0, data: { mode: 'workspace-write' } },
