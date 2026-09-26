@@ -10,6 +10,9 @@
   "references": [
     { "path": "../../vendor/cordis" },
     { "path": "../../packages/core/agent" },
+    { "path": "../../packages/core/session" },
+    { "path": "../../packages/interaction/user-approval" },
+    { "path": "../../packages/interaction/user-questions" },
     { "path": "../../packages/jobs/jobs" },
     { "path": "../../packages/schedule/schedule" },
     { "path": "../../packages/workspace/workspace" },

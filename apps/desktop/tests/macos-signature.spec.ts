@@ -42,9 +42,10 @@ describe('desktop macOS release signature', () => {
   it('loads release identifiers from the environment and requires code signing', async () => {
     const { createElectronBuilderConfig } = await import('../electron-builder.config.mjs')
     const config = createElectronBuilderConfig(RELEASE_ENVIRONMENT, 'darwin', 'arm64')
-    expect(config.protocols).toEqual([{ name: 'DeepSeek Harness', schemes: ['dsh'] }])
+    expect(config.protocols).toEqual([{ name: '思灵', schemes: ['dsh'] }])
     expect(portablePath(config.directories.output)).toContain('/.desktop-build/targets/mac-arm64/artifacts')
-    expect(config.mac.extendInfo.NSMicrophoneUsageDescription).toContain('microphone')
+    // SSiD：这条描述已本地化为中文（产品名也从 DeepSeek Harness 换成思灵）。
+    expect(config.mac.extendInfo.NSMicrophoneUsageDescription).toContain('麦克风')
     expect(config.mac.entitlementsInherit).toBe(config.mac.entitlements)
     const entitlements = readFileSync(config.mac.entitlements, 'utf8')
     for (const key of ['com.apple.security.cs.allow-jit', 'com.apple.security.cs.allow-unsigned-executable-memory',
@@ -112,7 +113,7 @@ describe('desktop macOS release signature', () => {
     }, 'win32')).toThrow(/DSH_DESKTOP_WINDOWS_CER_FILE/u)
   })
 
-  it('isolates unsigned Windows artifacts and omits updater metadata without release credentials', async () => {
+  it('isolates unsigned Windows artifacts and still points them at the GitHub release feed', async () => {
     const { createElectronBuilderConfig } = await import('../electron-builder.config.mjs')
     const config = createElectronBuilderConfig({
       DSH_DESKTOP_APP_ID: RELEASE_ENVIRONMENT.DSH_DESKTOP_APP_ID,
@@ -123,9 +124,13 @@ describe('desktop macOS release signature', () => {
     }, 'win32', 'x64')
     expect(portablePath(config.directories.output)).toContain('/targets/win-x64/unsigned-artifacts')
     expect(portablePath(config.nsis.include)).toMatch(/\/scripts\/installer\.nsh$/u)
+    // SSiD：官方让未签名产物不带更新元数据（`publish: null`）。思灵不买签名证书，构建恒为
+    // unsigned，但仍要自动更新，所以未签名构建也写 feed 指向公开的 GitHub Releases ——
+    // 代价是更新包没有签名校验，那是「不签名」这一决定本身的既有代价，不是新增的。
+    // 产物依旧隔离在独立输出目录，不会混进正式产物。
     expect(config).toMatchObject({
       win: { forceCodeSigning: false, signtoolOptions: { sign: undefined } },
-      publish: null,
+      publish: [{ provider: 'github', owner: 'Max-Null', repo: 'seek-soul-in-darkness' }],
     })
   })
 

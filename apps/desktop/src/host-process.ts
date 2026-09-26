@@ -23,18 +23,67 @@ interface PlatformSessionEvent {
   readonly session: PlatformSession | null
 }
 
-type DesktopHostEvent = ReadyEvent | FatalEvent | PlatformSessionEvent | { readonly type: 'shutdown-complete' } | {
-  readonly type: 'update-tasks'
+/** SSiD 通知事件：壳按 `~/.ssid/notify.json` 决定是否投递为原生通知。 */
+interface SsidNotifyEvent {
+  readonly type: 'ssid-notify'
+  readonly scene: 'replyDone' | 'approval' | 'question'
+  readonly toolName?: string
+  readonly startedAt?: number
+  readonly endedAt?: number
+}
+
+/** 截图浮层可执行的动作。`trigger` 开浮层，`apply` 改配置后重注册全局热键。 */
+type SsidScreenshotAction = 'trigger' | 'apply'
+
+/** 保活状态机关心的两个事实。 */
+type SsidKeepAwakePhase = 'turnStart' | 'turnEnd'
+
+/**
+ * 保活事实（Host → 壳）。
+ *
+ * 与 `ssid-notify` **分道**：保活要任何 `turn/end` 都递减计数，通知只在
+ * `reason.kind === 'completed'` 时播报。合并成一条会让中断的回合漏减，保活再也释放不掉。
+ */
+interface SsidKeepAwakeEvent {
+  readonly type: 'ssid-keep-awake'
+  readonly phase: SsidKeepAwakePhase
+}
+
+/**
+ * Host 请壳执行一次截图动作（**Host → 壳**方向）。
+ *
+ * 截图浮层与全局快捷键都在 Electron 主进程，Host 子进程没有这些 API；这条消息
+ * 是唯一的通道。`apply` 带 `requestId`（要等壳回执才知道键位是否占上），
+ * `trigger` 不带（单向——截图结果由壳直接派发页面事件给 dsh-capture，Host 不需要信号）。
+ */
+interface SsidScreenshotRequestEvent {
+  readonly type: 'screenshot-request'
+  readonly action: SsidScreenshotAction
+  readonly requestId?: number
+}
+
+/** 壳对一次 `apply` 的答复。`trigger` 是单向的，壳不回执。 */
+interface SsidScreenshotResultEvent {
+  readonly type: 'screenshot-result'
   readonly requestId: number
-  readonly active: boolean
-  readonly error?: string
-} | {
-  readonly type: 'quit-inspection'
-  readonly requestId: number
-  readonly activeTasks: boolean
-  readonly scheduledTasks: boolean
+  readonly ok: boolean
+  /** 壳执行失败时的原因；与另外两条控制答复保持同一字段。 */
   readonly error?: string
 }
+
+type DesktopHostEvent = ReadyEvent | FatalEvent | PlatformSessionEvent | SsidNotifyEvent | SsidScreenshotRequestEvent
+  | SsidScreenshotResultEvent | SsidKeepAwakeEvent | { readonly type: 'shutdown-complete' } | {
+    readonly type: 'update-tasks'
+    readonly requestId: number
+    readonly active: boolean
+    readonly error?: string
+  } | {
+    readonly type: 'quit-inspection'
+    readonly requestId: number
+    readonly activeTasks: boolean
+    readonly scheduledTasks: boolean
+    readonly error?: string
+  }
 
 /** Correlated answer to one shell control request. */
 type DesktopHostControlResponse = Extract<DesktopHostEvent, { readonly requestId: number }>
@@ -77,6 +126,14 @@ function isDesktopHostEvent(message: unknown): message is DesktopHostEvent {
           && (url.protocol === 'https:' || (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)))
       } catch { return false }
     }
+    case 'ssid-notify': {
+      const scene = candidate.scene
+      if (scene !== 'replyDone' && scene !== 'approval' && scene !== 'question') return false
+      if ('toolName' in candidate && typeof candidate.toolName !== 'string') return false
+      if ('startedAt' in candidate && typeof candidate.startedAt !== 'number') return false
+      if ('endedAt' in candidate && typeof candidate.endedAt !== 'number') return false
+      return true
+    }
     case 'fatal':
       return typeof candidate.message === 'string' && (candidate.diagnostic === undefined || typeof candidate.diagnostic === 'string')
     case 'update-tasks':
@@ -85,6 +142,17 @@ function isDesktopHostEvent(message: unknown): message is DesktopHostEvent {
     case 'quit-inspection':
       return Number.isSafeInteger(candidate.requestId) && typeof candidate.activeTasks === 'boolean'
         && typeof candidate.scheduledTasks === 'boolean' && (candidate.error === undefined || typeof candidate.error === 'string')
+    case 'screenshot-request': {
+      if (candidate.action !== 'trigger' && candidate.action !== 'apply') return false
+      // `trigger` 单向（无 requestId）；`apply` 必须带配对号，否则壳无法回执。
+      return candidate.requestId === undefined
+        ? candidate.action === 'trigger'
+        : Number.isSafeInteger(candidate.requestId)
+    }
+    case 'screenshot-result':
+      return Number.isSafeInteger(candidate.requestId) && typeof candidate.ok === 'boolean'
+    case 'ssid-keep-awake':
+      return candidate.phase === 'turnStart' || candidate.phase === 'turnEnd'
     default:
       return false
   }
@@ -165,6 +233,7 @@ export class DesktopHostProcess {
    *   `office-skills` resources fail Host startup.
    * @param packageManager - Bundled pnpm entry and Node launcher directory, scoped to package operations.
    * @param onPlatformSession - Private credential updates for embedded Platform views.
+   * @param onSsidNotify - SSiD notification events; the shell renders them as native notifications.
    */
   constructor(
     private readonly node: string,
@@ -177,6 +246,11 @@ export class DesktopHostProcess {
     private readonly packageManager?: { readonly pnpm: string; readonly nodeBin: string },
 
     private readonly onPlatformSession?: (session: PlatformSession | null) => void,
+    private readonly onSsidNotify?: (event: SsidNotifyEvent) => void,
+    /** SSiD 截图：Host 的插件请求壳执行一次截图动作（壳回 `ok` 作为答复）。 */
+    private readonly onScreenshot?: (action: SsidScreenshotAction) => Promise<boolean>,
+    /** SSiD 保活：Host 上报一轮的开始/结束，壳据此持有或释放 `powerSaveBlocker`。 */
+    private readonly onKeepAwake?: (phase: SsidKeepAwakePhase) => void,
   ) {}
 
   /**
@@ -211,6 +285,10 @@ export class DesktopHostProcess {
       }
       if (message.type === 'ready') this.readyResolve({ url: message.url, injections: message.injections })
       else if (message.type === 'platform-session') this.onPlatformSession?.(message.session)
+      else if (message.type === 'ssid-notify') this.onSsidNotify?.(message)
+      else if (message.type === 'ssid-keep-awake') this.onKeepAwake?.(message.phase)
+      // 截图动作：Host 的插件经 `ssid.shell.screenshot` 发起，壳在这里执行。
+      else if (message.type === 'screenshot-request') void this.answerScreenshot(message)
       else if (message.type === 'shutdown-complete') {
         if (this.stopping) this.shutdownCompleted = true
         else this.fail(new Error('dsh desktop host acknowledged an unrequested shutdown'))
@@ -247,6 +325,30 @@ export class DesktopHostProcess {
   }
 
   /**
+   * 转达 Host 的一次截图动作请求，并把壳的结果答复回去。
+   *
+   * `trigger` 也要回一条：Host 侧等的是「壳收到了」这个事实本身，用不到成功位，
+   * 但回一条能让它的 5 秒兜底定时器立刻清掉，而不是每次截图都空等。
+   * @param request - 宿主发来的动作与配对号。
+   */
+  private async answerScreenshot(request: SsidScreenshotRequestEvent): Promise<void> {
+    let ok = false
+    let error: string | undefined
+    try {
+      ok = this.onScreenshot === undefined ? false : await this.onScreenshot(request.action)
+    } catch (caught) {
+      // `caught` 是 IPC 边界的未知值，按惯例取 message 字符串。
+      error = caught instanceof Error ? caught.message : String(caught)
+      console.warn('[screenshot] shell action failed:', error)
+      ok = false
+    }
+    // `trigger` 是单向的：没有配对号就不回执——回一条 `requestId: undefined` 会被
+    // Host 侧的事件校验判为非法，直接 kill 掉整个 Host 子进程（2026-09-26 实测）。
+    if (request.requestId === undefined) return
+    this.child?.send?.({ type: 'screenshot-result', requestId: request.requestId, ok, ...(error === undefined ? {} : { error }) } satisfies SsidScreenshotResultEvent)
+  }
+
+  /**
    * Ask the Host what quitting now would interrupt.
    * @returns Active tasks and armed scheduled reminders; rejects when the Host is unavailable or misses
    * {@link QUIT_INSPECTION_DEADLINE_MS}, and the shell then asks before quitting.
@@ -271,8 +373,7 @@ export class DesktopHostProcess {
       return await new Promise<DesktopHostControlResponse>((resolve, reject) => {
         this.controlRequests.set(requestId, { resolve, reject })
         timer = setTimeout(() => { reject(new Error(deadlineMessage)) }, deadlineMs)
-        child.send({ ...request, requestId }, (error) => { if (error !== null) reject(error) })
-      })
+        child.send({ ...request, requestId }, (error) => { if (error !== null) reject(error) })      })
     } finally {
       clearTimeout(timer)
       this.controlRequests.delete(requestId)

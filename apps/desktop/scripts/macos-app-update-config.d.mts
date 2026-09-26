@@ -1,17 +1,19 @@
-/** Resolved fields required to embed a macOS updater feed. */
-export interface MacOSAppUpdateFeed {
-  readonly publicUrl: string
-}
+/**
+ * Resolved fields required to embed a macOS updater feed.
+ *
+ * `generic` 分支的 `provider` 可选：`package-macos.ts` 直接把 COS 配置
+ * （`DesktopAutoUpdateConfig`，只有 `publicUrl`）传进来，语义上就是 generic 来源。
+ */
+export type MacOSAppUpdateFeed =
+  | { readonly provider?: 'generic', readonly publicUrl: string }
+  | { readonly provider: 'github', readonly owner: string, readonly repo: string }
 
 /** Packaged electron-updater configuration for macOS. */
-export interface MacOSAppUpdateConfig {
-  readonly provider: 'generic'
-  readonly url: string
-  readonly channel: 'nightly'
-  readonly updaterCacheDirName: string
-}
+export type MacOSAppUpdateConfig =
+  | { readonly provider: 'generic', readonly url: string, readonly channel: 'nightly', readonly updaterCacheDirName: string }
+  | { readonly provider: 'github', readonly owner: string, readonly repo: string, readonly updaterCacheDirName: string }
 
-/** Resolve the one generic macOS feed from the final electron-builder configuration. */
+/** Resolve the macOS feed from the final electron-builder configuration (generic COS or GitHub Releases). */
 export function resolveMacOSAppUpdateFeed(publish: unknown): MacOSAppUpdateFeed
 
 /** Create the electron-updater configuration embedded before code signing. */

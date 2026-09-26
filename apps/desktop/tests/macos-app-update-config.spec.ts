@@ -10,7 +10,7 @@ import {
 } from '../scripts/macos-app-update-config.mjs'
 
 const roots: string[] = []
-const update = { publicUrl: 'https://desktop-updates.example.com/dsh-desk/feeds/mac-arm64/' }
+const update = { provider: 'generic' as const, publicUrl: 'https://desktop-updates.example.com/dsh-desk/feeds/mac-arm64/' }
 
 async function fixture(): Promise<{ appPath: string; resourcesDir: string }> {
   const root = await mkdtemp(join(tmpdir(), 'desktop-macos-update-config-'))
@@ -29,10 +29,25 @@ describe('macOS packaged updater configuration', () => {
   it('uses the final generic Nightly provider configured for the build', () => {
     expect(resolveMacOSAppUpdateFeed([{ provider: 'generic', url: update.publicUrl, channel: 'nightly' }]))
       .toEqual(update)
-    for (const publish of [undefined, [], [{ provider: 'github', channel: 'nightly', url: update.publicUrl }],
+    for (const publish of [undefined, [],
       [{ provider: 'generic', channel: 'latest', url: update.publicUrl }]]) {
       expect(() => resolveMacOSAppUpdateFeed(publish)).toThrow(/macOS update config/u)
     }
+  })
+
+  // SSiD：GitHub Releases 也是合法来源（思灵的发布方式），因此不再要求 generic + Nightly。
+  it('accepts a GitHub Releases provider end to end', async () => {
+    const feed = { provider: 'github' as const, owner: 'Max-Null', repo: 'seek-soul-in-darkness' }
+    expect(resolveMacOSAppUpdateFeed([feed])).toEqual(feed)
+    expect(createMacOSAppUpdateConfig(feed, 'ssid-updater')).toEqual({
+      provider: 'github',
+      owner: 'Max-Null',
+      repo: 'seek-soul-in-darkness',
+      updaterCacheDirName: 'ssid-updater',
+    })
+    const paths = await fixture()
+    await writeMacOSAppUpdateConfig(paths.resourcesDir, feed, 'ssid-updater')
+    await expect(verifyMacOSAppUpdateConfig(paths.appPath, feed, 'ssid-updater')).resolves.toBeUndefined()
   })
 
   it('writes and verifies the fixed release feed before signing', async () => {

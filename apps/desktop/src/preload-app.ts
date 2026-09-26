@@ -9,6 +9,7 @@ import { syncNativeTheme } from './preload-theme.ts'
 import { syncWindowsAppearance } from './preload-windows.ts'
 import { installMandatoryUpdateOverlay } from './preload-mandatory-overlay.ts'
 import { createDesktopBrowserBridge } from './preload-browser.ts'
+import { isSsidTitlebarChannel } from './ssid/titlebar-channels.ts'
 
 function createProductApi(): DshDesktopProductApi {
   return {
@@ -90,6 +91,14 @@ if (location.protocol === `${SCHEME}:` && location.hostname === 'app') {
     open: (page: 'usage' | 'top-up', bounds: { x: number; y: number; width: number; height: number }) => ipcRenderer.invoke(PLATFORM_IPC.open, page, bounds),
     setBounds: (bounds: { x: number; y: number; width: number; height: number }) => ipcRenderer.invoke(PLATFORM_IPC.bounds, bounds),
     close: () => ipcRenderer.invoke(PLATFORM_IPC.close),
+  })
+  // SSiD：官方把最小化 / 最大化 / 关闭交给原生 `titleBarOverlay` 绘制，自绘标题栏
+  // 之后页面必须能主动发指令。转发口只放行 `ssid:title:` 的固定三条通道，
+  // 页面拿不到任意 IPC 通道；主进程侧另有窗口与主框架校验。
+  // 返回 invoke 的 Promise，调用方因此能感知失败，而不是静默无反应。
+  contextBridge.exposeInMainWorld('__ssidIpcInvoke', (channel: unknown): Promise<void> | undefined => {
+    if (!isSsidTitlebarChannel(channel)) return undefined
+    return ipcRenderer.invoke(channel) as Promise<void>
   })
 }
 

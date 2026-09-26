@@ -2,7 +2,7 @@ import { defineConfig } from 'tsdown'
 import { build } from 'vite'
 import { fileURLToPath } from 'node:url'
 import { readFileSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { copyFile, readFile } from 'node:fs/promises'
 import { repositoryClientBuildEnvironment, resolveClientBuildEnvironment } from '../../scripts/client-build-environment.ts'
 import { packagedImportsPlugin } from './scripts/desktop-bundle-imports.mjs'
 
@@ -67,6 +67,12 @@ export default defineConfig([
           },
         },
       })
+      // SSiD 截图浮层是纯静态页面（内联样式与脚本，没有构建步骤），直接复制进 lib ——
+      // 与 main.js 同目录，主进程按相对路径 loadFile。
+      await copyFile(
+        new URL('./resources/screenshot.html', import.meta.url),
+        new URL('./lib/screenshot.html', import.meta.url),
+      )
     },
     outDir: 'lib',
     format: ['esm'],
@@ -77,7 +83,7 @@ export default defineConfig([
     clean: false,
     deps: { neverBundle: ['electron'] },
   },
-  ...(['preload-app', 'preload-welcome', 'preload-platform-account', 'preload-mandatory', 'preload-update-dialog'] as const).map(name => ({
+  ...(['preload-app', 'preload-welcome', 'preload-platform-account', 'preload-mandatory', 'preload-update-dialog', 'preload-screenshot'] as const).map(name => ({
     // Sandboxed Electron preloads run as CommonJS even though the application package is ESM.
     entry: { [name]: `lib/types/${name}.js` },
     plugins: [packagedImportsPlugin(preloadImports)],

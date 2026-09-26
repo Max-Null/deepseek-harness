@@ -1,5 +1,4 @@
 import type { AccountView } from '@deepseek-ai/dsh-deepseek-account/types'
-import { WINDOWS_TITLEBAR_HEIGHT } from '../src/windows-layout.ts'
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import type { IpcMainInvokeEvent } from 'electron'
 import { join } from 'node:path'
@@ -76,6 +75,8 @@ const harness = await vi.hoisted(async () => {
       mainFrame: { url: '' },
       getZoomFactor: () => 1,
       isDestroyed: () => this.destroyed,
+      executeJavaScript: vi.fn(async () => undefined),
+      isLoading: () => false,
       setIgnoreMenuShortcuts: vi.fn(),
       focus: vi.fn(),
       sendInputEvent: vi.fn(),
@@ -292,6 +293,7 @@ vi.mock('electron', () => ({
   powerMonitor: harness.powerMonitor,
   Tray: harness.FakeTray,
   nativeImage: { createFromPath: (path: string) => ({ path }) },
+  globalShortcut: { register: () => true, unregisterAll: vi.fn() },
 }))
 vi.mock('../src/background-notice.ts', () => ({ DesktopBackgroundNotice: class {
   constructor(options: { markerPath: string }) { harness.backgroundNotice.markerPath = options.markerPath }
@@ -511,7 +513,7 @@ describe('desktop main startup', () => {
     await vi.advanceTimersByTimeAsync(0)
     const zh = locale === 'zh-CN'
     expect(harness.dialog.showMessageBox).toHaveBeenLastCalledWith(expect.objectContaining({
-      type: 'info', title: zh ? '关于 DeepSeek Harness' : 'About DeepSeek Harness', message: 'DeepSeek Harness',
+      type: 'info', title: zh ? '关于 思灵' : 'About 思灵', message: '思灵',
       detail: zh ? '版本 V1.0.0' : 'Version V1.0.0', buttons: [zh ? '确定' : 'OK'], cancelId: 0,
     }))
     // A dialog that cannot open is logged, not surfaced as an unhandled rejection.
@@ -692,7 +694,10 @@ describe('desktop main startup', () => {
     if (platform === 'darwin') {
       expect(window.options).toMatchObject({ titleBarStyle: 'hiddenInset', vibrancy: 'sidebar', backgroundColor: '#00000000' })
     } else if (platform === 'win32') {
-      expect(window.options).toMatchObject({ titleBarStyle: 'hidden', titleBarOverlay: { height: WINDOWS_TITLEBAR_HEIGHT } })
+      // SSiD：Windows 的原生 titleBarOverlay 已被主进程注入的自绘标题栏取代（ssid/titlebar.ts），
+      // 窗口本身仍是无边框，但覆盖层不再存在。
+      expect(window.options).toMatchObject({ titleBarStyle: 'hidden' })
+      expect(window.options).not.toHaveProperty('titleBarOverlay')
       expect(window.options).not.toHaveProperty('vibrancy')
       expect(harness.menu.mock.calls[0]![0]).toEqual([
         { role: 'toggleDevTools', visible: false },
@@ -799,24 +804,29 @@ describe('desktop main startup', () => {
     const window = harness.windows[0]!
     const listener = harness.ipcOn.mock.calls.find(([channel]) => channel === DESKTOP_IPC.windowsAppearance)![1]
     const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame }
+    // SSiD：Windows 没有原生 titleBarOverlay 可更新了，自绘标题栏改由注入脚本跟随调色板
+    // （`applySsidTitlebarTheme`）。建窗时已注入过标题栏本身，这里先清账再验事件驱动的部分。
+    window.webContents.executeJavaScript.mockClear()
     listener({ ...event, senderFrame: { url: 'dsh-app://app/' } }, 'zh-CN', '#ffffff', '#000000')
-    expect(window.setTitleBarOverlay).not.toHaveBeenCalled()
+    expect(window.webContents.executeJavaScript).not.toHaveBeenCalled()
     listener(event, 'zh-CN', 'rgb(249, 250, 251)', '#0f1115')
-    expect(window.setTitleBarOverlay).toHaveBeenCalledWith({ color: 'rgb(249, 250, 251)', symbolColor: '#0f1115' })
+    expect(window.webContents.executeJavaScript).toHaveBeenLastCalledWith(
+      expect.stringContaining('rgb(249, 250, 251)'), true)
     window.webContents.emit('context-menu', {}, { isEditable: false, selectionText: 'text', editFlags: { canCopy: true } })
     expect(harness.menu.buildFromTemplate).toHaveBeenLastCalledWith([{ role: 'copy', enabled: true, label: '复制', accelerator: '' }])
     listener(event, 'en', '#1b1b1c', '#f9fafb')
     window.webContents.emit('context-menu', {}, { isEditable: false, selectionText: 'text', editFlags: { canCopy: true } })
     expect(harness.menu.buildFromTemplate).toHaveBeenLastCalledWith([{ role: 'copy', enabled: true, label: 'Copy', accelerator: '' }])
-    window.setTitleBarOverlay.mockClear()
+    window.webContents.executeJavaScript.mockClear()
     listener(event, 'en', 'url(file:///bad)', '#fff')
-    expect(window.setTitleBarOverlay).not.toHaveBeenCalled()
+    expect(window.webContents.executeJavaScript).not.toHaveBeenCalled()
     listener(event, {}, '#fff', '#000')
-    expect(window.setTitleBarOverlay).toHaveBeenLastCalledWith({ color: '#fff', symbolColor: '#000' })
-    window.setTitleBarOverlay.mockClear()
+    expect(window.webContents.executeJavaScript).toHaveBeenLastCalledWith(
+      expect.stringContaining('#fff'), true)
+    window.webContents.executeJavaScript.mockClear()
     window.webContents.mainFrame.url = 'dsh-app://unowned/index.html'
     listener(event, 'zh-CN', '#fff', '#000')
-    expect(window.setTitleBarOverlay).not.toHaveBeenCalled()
+    expect(window.webContents.executeJavaScript).not.toHaveBeenCalled()
     expect(harness.menu.setApplicationMenu).toHaveBeenCalledOnce()
   })
 
@@ -835,7 +845,7 @@ describe('desktop main startup', () => {
     expect(() => handler(event, 'application', NaN, 34)).toThrow('invalid popup request')
     const application = handler(event, 'application', 48, 34)
     expect(harness.menu.buildFromTemplate.mock.lastCall![0].map(item => item.label ?? item.type)).toEqual([
-      '关于 DeepSeek Harness', 'separator', '检查更新…', 'separator', '退出',
+      '关于 思灵', 'separator', '检查更新…', 'separator', '退出',
     ])
     expect(harness.popup.mock.lastCall![0]).toMatchObject({ window, x: 48, y: 34 })
     expect(harness.popup.mock.lastCall![0].callback).toBeTypeOf('function')

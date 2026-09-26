@@ -1,5 +1,14 @@
 import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-product-analytics/types'
 import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
+import { applySsidTitlebarTheme, installSsidTitlebar, toggleSsidContrast } from './ssid/titlebar.ts'
+
+/**
+ * 纯净模式命令行标志：托盘「以纯净模式重启」把它拼进重启参数，下次启动时 Host
+ * 只加载官方 bundle 层（见 `desktop-host/src/index.ts`）。必须在拉起 Host 之前生效，
+ * 故在模块顶层解析——Host 是子进程，继承这份环境变量。
+ */
+const SAFE_MODE_FLAG = '--ssid-safe-mode'
+if (process.argv.includes(SAFE_MODE_FLAG)) process.env.SSID_SAFE_MODE = '1'
 /** Electron shell: desktop project ownership, custom protocol, windows, and lifecycle. */
 
 import { readFile, writeFile } from 'node:fs/promises'
@@ -10,9 +19,11 @@ import {
   BrowserWindow,
   clipboard,
   dialog,
+  globalShortcut,
   ipcMain,
   Menu,
   powerMonitor,
+  powerSaveBlocker,
   nativeImage,
   nativeTheme,
   net,
@@ -22,6 +33,14 @@ import {
   type IpcMainInvokeEvent,
   type MenuItemConstructorOptions,
 } from 'electron'
+import { SsidMask, readSsidMaskConfig } from './ssid/mask.ts'
+import { SsidScreenshot, readSsidScreenshotConfig } from './ssid/screenshot.ts'
+import { createKeepAwake, readKeepAwakeConfig, type KeepAwake } from './ssid/keep-awake.ts'
+import { recordCodeGraphDecision, shouldGuideCodeGraph } from './ssid/codegraph-guide.ts'
+import { installSsidMcpEnv } from './ssid/mcp-env.ts'
+import { resolveProfileName } from './ssid/profile-name.ts'
+import { seedSsidProfile } from './ssid/profile-seed.ts'
+import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { resolveDesktopPaths } from './paths.ts'
 import { DesktopProjectManager } from './project-manager.ts'
 import { DesktopHostFatalError, DesktopHostProcess, DesktopHostUncleanExitError } from './host-process.ts'
@@ -29,6 +48,8 @@ import { DesktopPlatformView, PLATFORM_IPC, platformBounds } from './platform-vi
 import { installDesktopDirectoryPicker } from './directory-picker.ts'
 import { installMicrophonePermissions } from './microphone-permissions.ts'
 import { DesktopBackendController } from './backend-controller.ts'
+import { deliverSsidNotify, describeSsidNotify } from './ssid/notify.ts'
+import { DSH_PRODUCT_NAME, SSID_PRODUCT_NAME } from './ssid/product.ts'
 import { DESKTOP_IPC, SCHEME, assertDesktopSender, type DesktopUpdateState } from './ipc.ts'
 import { readDeviceInfo } from './device-info.ts'
 import { desktopUpdateReadyConfirmation, formatDesktopMessage, resolveDesktopLocale, resolveDesktopStartupLocale } from './locale.ts'
@@ -88,15 +109,39 @@ function quitWithoutConfirmation(): void {
   skipQuitConfirmation = true
   app.quit()
 }
+/**
+ * 备份 profile patch 并禁用全部第三方 bundle。
+ *
+ * 崩溃恢复对话框与托盘「禁用第三方插件并重启」共用同一条路径 —— 它调的是 app-boot 的共享
+ * recovery 函数，本身不要求进程处于崩溃状态，因此在正常运行中调用同样成立。
+ * 注意与既有思灵壳的「纯净模式」语义不同：那个只少加载层、不改 profile（去掉环境变量即恢复），
+ * 这个会真的备份并清空 patch，恢复需要人工处理。
+ *
+ * 托盘已改用非破坏的 `restartInSafeMode`，本函数现在只由崩溃恢复对话框调用。
+ */
+async function disableThirdPartyPlugins(): Promise<void> {
+  const manager = new DesktopProjectManager(resolveDesktopPaths(), runtimeResources())
+  const backupPath = await manager.disableAllPlugins()
+  console.info('Desktop profile recovery completed:', { profilePatchBackup: backupPath ?? null, homePatch: 'unchanged' })
+}
+
+/**
+ * 以纯净模式重启。
+ *
+ * 只让下次启动少加载第三方层，**不碰任何数据**（会话 / 设置 / 记忆 / storage 原样），
+ * 去掉标志即恢复 —— 与上面那个会备份并清空 patch 的 `disableThirdPartyPlugins` 语义不同，
+ * 后者现在只由崩溃恢复对话框使用。Host 侧按层过滤，见 `desktop-host/src/index.ts`。
+ */
+function restartInSafeMode(): void {
+  app.relaunch({ args: [...process.argv.slice(1), SAFE_MODE_FLAG] })
+  quitWithoutConfirmation()
+}
+
 const recovery = new DesktopFatalRecovery({
   messages: () => currentDesktopLocale().messages,
   show: options => dialog.showMessageBox(options),
   stop: () => { shuttingDown = true; return stopForRecovery() },
-  disablePlugins: async () => {
-    const manager = new DesktopProjectManager(resolveDesktopPaths(), runtimeResources())
-    const backupPath = await manager.disableAllPlugins()
-    console.info('Desktop profile recovery completed:', { profilePatchBackup: backupPath ?? null, homePatch: 'unchanged' })
-  },
+  disablePlugins: () => disableThirdPartyPlugins(),
   exit: () => { quitWithoutConfirmation() },
   restart: () => { app.relaunch(); quitWithoutConfirmation() },
   writeReport: (error, source) => persistCrashReport(error, source),
@@ -158,6 +203,83 @@ function runtimeResources(): RuntimeResources {
   return { node, nodeBin, pnpm, dsh }
 }
 
+/**
+ * 随包插件集根目录（A′ 交付形态的实体来源）。
+ *
+ * 打包版固定在 `resources/ssid-plugins`；开发期用 `SSID_PLUGIN_SET_DIR` 覆盖 ——
+ * dev 的 `process.resourcesPath` 指向 Electron 自带的 resources，那里没有插件集。
+ * @returns 插件集根目录（可能不存在，调用方按「没有插件集」处理）。
+ */
+function resolvePluginSetRoot(): string {
+  const override = process.env.SSID_PLUGIN_SET_DIR
+  if (override !== undefined && override !== '') return override
+  return join(process.resourcesPath, 'ssid-plugins')
+}
+
+/**
+ * 把随包插件集接入 profile（实现见 `ssid/profile-seed.ts`）。
+ *
+ * 失败不阻断启动：插件集缺失或链接失败时，应用仍按官方骨架起来，只是没有思灵插件。
+ * 但 `missing` 必须报出来 —— 内核遇到解析不到的插件是**静默跳过**的
+ * （实测：只有渲染进程的 client 清单里少一行，`Failed to load plugins` 一次都不出现）。
+ * @param profileDir - 当前 profile 目录。
+ */
+function seedProfilePlugins(profileDir: string): void {
+  try {
+    const summary = seedSsidProfile({
+      profileDir,
+      pluginSetRoot: resolvePluginSetRoot(),
+      log: (text: string) => { console.log(`ssid: ${text}`) },
+    })
+    if (summary.missing.length > 0) {
+      console.error(`ssid: plugin set incomplete — declared but not shipped: ${summary.missing.join(', ')}`)
+    }
+  } catch (error) {
+    console.error(`ssid: plugin set seed failed: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+/**
+ * CodeGraph 索引目录首次引导：目录解析不出来、且用户从未表过态时问一次。
+ *
+ * **只在窗口可见之后调用，且调用方不 await** —— 早先它挂在 MCP env 注入的 await 链上，
+ * 会把 Host 启动**永久卡在等待点击**上（2026-09-26 用全新 DSH_HOME 实测：没有会话可探测、
+ * `~/.ssid/codegraph.json` 又缺席，日志停在 `mcp codegraph cli missing` 之后不再前进，
+ * 进程活着但 Host 永不 spawn）。窗口不可见时直接返回：那是无人值守启动，问了也没人答。
+ *
+ * 结果写进 `~/.ssid/codegraph.json`，**下次启动生效** —— env 必须在 Host 起来前定，
+ * 本次已经来不及了。
+ * @param win - 主窗口；未创建、已销毁或不可见时直接返回。
+ */
+async function guideCodeGraphWorkspace(win: BrowserWindow | undefined): Promise<void> {
+  try {
+    if (win === undefined || win.isDestroyed() || !win.isVisible()) return
+    if (!shouldGuideCodeGraph({ dshHome: resolveDshHome(), profileName: resolveProfileName() })) return
+    const { response } = await dialog.showMessageBox(win, {
+      type: 'question',
+      buttons: ['选择项目目录…', '暂不启用'],
+      defaultId: 0,
+      cancelId: 1,
+      title: `${SSID_PRODUCT_NAME} · CodeGraph 代码索引`,
+      message: 'CodeGraph 需要指定一个项目目录才能建立代码图谱。',
+      detail: '不指定时代码索引工具保持停用，不会扫描你的用户主目录。选好后重启思灵生效，'
+        + '以后也可在「设置 → MCP」里修改。',
+    })
+    let workspace: string | null = null
+    if (response === 0) {
+      const picked = await dialog.showOpenDialog(win, {
+        title: '选择要建立代码图谱的项目目录',
+        properties: ['openDirectory', 'createDirectory'],
+      })
+      if (!picked.canceled && picked.filePaths.length > 0) workspace = picked.filePaths[0] ?? null
+    }
+    recordCodeGraphDecision(workspace)
+    console.log(`ssid: codegraph workspace decided (${workspace ?? 'disabled'}); applies on next launch`)
+  } catch (error) {
+    console.error(`ssid: codegraph guide failed: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
 function developmentPrimaryRuntime(): string {
   const directory = process.env.DSH_DESKTOP_PRIMARY_RUNTIME_DIR
   if (directory === undefined || directory === '') {
@@ -201,6 +323,27 @@ function platformLoginUrl(authorizeUrl: string): string {
   return url.href
 }
 
+/** SSiD 遮罩的持有者。状态只有一份，托盘项与全局快捷键共用它。 */
+let ssidMask: SsidMask | undefined
+
+/** SSiD 截图引用的持有者。一次只允许一个会话，重复触发会被它自己忽略。 */
+let ssidScreenshot: SsidScreenshot | undefined
+
+/**
+ * SSiD 保活状态机。纯逻辑在 `ssid/keep-awake.ts`，这里只接 Electron 的 blocker
+ * 与 `~/.ssid/notify.json` 的读取。
+ *
+ * 持有来源有三个（并发 turn 计数 / 遮罩开启 / 结束后的尾巴窗口），任一需要就持有。
+ * turn 事实来自 Host 子进程（见 `createWindow` 里 host 的 `onKeepAwake`），
+ * 遮罩事实来自 `SsidMask` 的状态回调。
+ */
+const keepAwake: KeepAwake = createKeepAwake({
+  start: () => powerSaveBlocker.start('prevent-display-sleep'),
+  stop: (id) => { powerSaveBlocker.stop(id) },
+  readConfig: readKeepAwakeConfig,
+  log: (text) => { console.log(`ssid: ${text.trim()}`) },
+})
+
 function createWindow(preload: string, show = false, primary = false): BrowserWindow {
   const window = new BrowserWindow({
     width: 1280,
@@ -210,9 +353,18 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
     show,
     ...(process.platform === 'win32' && primary ? {
       titleBarStyle: 'hidden' as const,
-      titleBarOverlay: { height: WINDOWS_TITLEBAR_HEIGHT, color: chromeFallbackFill(),
-        symbolColor: nativeTheme.shouldUseDarkColors ? '#f9fafb' : '#0f1115' },
     } : {}),
+    // SSiD：任务栏与 Alt+Tab 显示的是窗口标题，而窗口标题默认由页面 <title> 派生 ——
+    // 页面用的是 DSH 的品牌名，于是自绘标题栏写着「思灵」、任务栏却写着「DeepSeek Harness」。
+    // 这里给出初值，页面标题的持续处理见下面 `page-title-updated`。
+    ...(primary ? { title: SSID_PRODUCT_NAME } : {}),
+    // SSiD：窗口图标。官方不设（打包后由 exe 自带图标），但源码裸跑时任务栏会显示
+    // Electron 的默认图标 —— dev 与打包产物看起来是同一个应用更省心。
+    ...(process.platform === 'darwin' ? {} : {
+      icon: app.isPackaged
+        ? join(process.resourcesPath, 'icon.png')
+        : join(app.getAppPath(), 'resources', 'icon-windows.png'),
+    }),
     // hiddenInset places traffic lights inside the sidebar; sidebar vibrancy
     // needs a transparent window background to show through the page.
     ...(process.platform === 'darwin' ? {
@@ -238,6 +390,46 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
     if (['http:', 'https:'].includes(new URL(url).protocol)) void shell.openExternal(url)
     return { action: 'deny' }
   })
+  // SSiD：把 Windows 的原生窗口控件换成自绘标题栏（同时也是插件按钮的载体）。
+  if (process.platform === 'win32' && primary) {
+    installSsidTitlebar(window, {
+      productName: SSID_PRODUCT_NAME,
+      dshVersion: app.getVersion(),
+      // 运行形态徽章只在非打包运行时出现，正式版不给自己加噪。
+      shellMode: app.isPackaged ? undefined : 'DEV',
+    })
+  }
+  // SSiD：页面 <title> 是 DSH 的品牌名，它经 `page-title-updated` 覆盖窗口标题，于是任务栏
+  // 和 Alt+Tab 显示「DeepSeek Harness」，而自绘标题栏写着「思灵」。官方两端同名，看不出差异，
+  // 因此上游只在 `policy-test-auth.ts` 那种自建窗口里阻止覆盖。这里做同样的事，但不止阻止：
+  // 页面若在标题里带了别的信息（DSH 以后可能用标题显示会话名），原样保留，只把品牌串换掉，
+  // 免得顺手把页面的这项能力一并吃掉。
+  if (primary) {
+    window.on('page-title-updated', (event, title) => {
+      event.preventDefault()
+      const branded = title.replaceAll(DSH_PRODUCT_NAME, SSID_PRODUCT_NAME)
+      window.setTitle(branded === '' ? SSID_PRODUCT_NAME : branded)
+    })
+  }
+  // SSiD 屏幕遮罩：只装主窗口。注入式实现依附页面，所以每次加载完成后按状态补回；
+  // 解除信号由页面经 console 回传（毛玻璃必须在同一页面内，见 `ssid/mask.ts`）。
+  if (primary) {
+    const mask = new SsidMask(
+      () => (window.isDestroyed() ? undefined : window),
+      // 遮罩开着时屏幕不能黑——黑了挂着的提示就白挂了。
+      (active) => { keepAwake.setMask(active) },
+    )
+    ssidMask = mask
+    window.webContents.on('did-finish-load', () => { mask.restore(window) })
+    window.webContents.on('console-message', (event) => {
+      if (SsidMask.isReleaseSignal(event.message)) mask.hide()
+    })
+  }
+  // SSiD 截图引用：浮层是独立窗口（每屏一个），与主窗口无关；但确认后要把图派发给
+  // 主窗口里的 dsh-capture 插件，所以仍要拿到主窗口。
+  if (primary) {
+    ssidScreenshot = new SsidScreenshot(() => (window.isDestroyed() ? undefined : window))
+  }
   if (process.platform === 'darwin' || process.platform === 'win32') {
     // Fullscreen hides native window controls; overlays drop their caption clearance.
     const sendFullscreen = (): void => {
@@ -421,9 +613,53 @@ async function main(): Promise<void> {
     const host = new DesktopHostProcess(resources.node, resources.dsh, activeProject,
       hostInspectPort, { ...process.env, DSH_CLIENT_VERSION: desktopClientVersion() }, onFailure,
       primaryRuntime,
-      resources, (next) => { platformView.setSession(next) })
+      resources, (next) => { platformView.setSession(next) },
+      (event) => { deliverSsidNotify(() => mainWindow, describeSsidNotify(event, SSID_PRODUCT_NAME), event.scene) },
+      // SSiD 截图：Host 侧的 dsh-capture 经 `ssid.shell.screenshot` 发起动作，
+      // 浮层与全局快捷键都在主进程，所以在这里执行。两个动作分开写而不是
+      // 三元，是为了让返回类型保持 boolean（trigger 恒 true——截图结果走页面事件）。
+      async (action) => {
+        if (action === 'trigger') {
+          // 用 Promise 包一层收窄栈：SsidScreenshot.trigger 内部是 fire-and-forget，
+          // 同步抛出的 RangeError（如递归）会直接穿透到 Host 路由变成 500。
+          try {
+            ssidScreenshot?.trigger()
+            return true
+          } catch (error) {
+            console.error('[screenshot] main-process trigger threw:', error instanceof Error ? error.stack ?? error.message : String(error))
+            return false
+          }
+        }
+        try {
+          return ssidScreenshot?.apply() ?? false
+        } catch (error) {
+          console.error('[screenshot] main-process apply threw:', error instanceof Error ? error.stack ?? error.message : String(error))
+          return false
+        }
+      },
+      // SSiD 保活：Host 上报的 turn 事实驱动状态机。**任何** turn/end 都要递减
+      // （含被中断的回合），这是它与通知分道的原因——见 ssid-keep-awake.ts。
+      (phase) => {
+        if (phase === 'turnStart') keepAwake.noteTurnStart()
+        else keepAwake.noteTurnEnd()
+      })
     return {
       start: async () => {
+        // SSiD 预制 MCP：env 必须在 `host.start()` 之前注入 —— Host 子进程继承 process.env，
+        // 而 profile 里那四条 mcp-client 条目的 command/args 全靠这些 env 求值。
+        // 缺失即条目自动停用（patch 的 `disabled` 表达式），不会让内核起不来。
+        // 这里**不弹任何对话框**：env 必须在 host.start() 之前定，而等人点击的对话框
+        // 会把启动永久卡住（全新 DSH_HOME 下实测过）。CodeGraph 的首次引导挪到
+        // Host 就绪之后，见 guideCodeGraphWorkspace()。
+        const mcpEnv = await installSsidMcpEnv({
+          profileDir: activeProject,
+          dshHome: resolveDshHome(),
+          profileName: resolveProfileName(),
+          log: (text) => { console.log(`ssid: ${text}`) },
+        })
+        console.log(`ssid: mcp ready (playwright=${String(mcpEnv.playwrightCli)}`
+          + ` codegraph=${String(mcpEnv.codegraphCli)} ws=${mcpEnv.codegraphWorkspace ?? '(none)'}`
+          + ` enabled=${mcpEnv.codegraphEnabled})`)
         const ready = await host.start()
         hostCookie = await authenticateWebHost(ready.url)
         hostUrl = ready.url
@@ -546,8 +782,13 @@ async function main(): Promise<void> {
       await navigateMain(applicationUrl)
       await backend.start(async () => {
         await manager.applyRelease()
+        // 官方这一步只建 profile 骨架（不装包），思灵的插件集由 seed 接入。
+        seedProfilePlugins(manager.paths.profile)
       })
       if (backend.host !== undefined) await openInitialWindow()
+      // 窗口真的显示出来之后再问 CodeGraph 目录；**不 await** —— 它只影响下次启动，
+      // 而等它会把启动路径重新变成「等人点击」。
+      void guideCodeGraphWorkspace(mainWindow)
       if (backend.host !== undefined) updateJournal?.action('workspace-ready')
       // The existing Web document resumes through the boot IPC response.
     })().catch((error: unknown) => {
@@ -556,6 +797,18 @@ async function main(): Promise<void> {
       throw error
     }).finally(() => { startup = undefined })
     return startup
+  }
+
+  /**
+   * 重启 DSH 内核（Host 子进程），不重启 Electron 壳。
+   *
+   * 走与启动同一条 `reconcileBackend` 路径：停掉 Host，再重新 prepare + start —— 端口、
+   * cookie 与 boot injections 都可能变，所以它内部连导航一起重来。插件配置改动靠它生效，
+   * 代价是工作区重新加载。
+   */
+  const restartBackend = async (): Promise<void> => {
+    await backend.stop()
+    await reconcileBackend()
   }
 
   const updates = new DesktopUpdateCoordinator(
@@ -900,7 +1153,7 @@ async function main(): Promise<void> {
   const applicationIconPath = development ? join(app.getAppPath(), 'resources', 'icon-windows.png')
     : join(process.resourcesPath, 'icon.png')
   app.setAboutPanelOptions({
-    applicationName: 'DeepSeek Harness',
+    applicationName: SSID_PRODUCT_NAME,
     applicationVersion: app.getVersion(),
     // The release has no separate build number; omit Electron's bundle version.
     version: '',
@@ -959,8 +1212,43 @@ async function main(): Promise<void> {
     // The tray is the way back to a hidden window; without it, relaunching the application still focuses it.
     try {
       tray = new DesktopTray({ iconPath: trayIconPath, locale: currentDesktopLocale,
-        open: () => { focusPrimaryWindow() }, quit: () => { app.quit() } })
+        open: () => { focusPrimaryWindow() }, quit: () => { app.quit() },
+        extras: {
+          // 官方的 Reload Page 与 Restart App and Host 只在开发菜单里，正式构建下不可达；
+          // 这里提升为托盘的常驻项，并补上「禁用第三方插件并重启」这个救援入口。
+          reload: () => { currentMainWindow()?.webContents.reload() },
+          restartBackend: () => {
+            void restartBackend().catch((failure: unknown) => { console.error('desktop tray: restart backend failed', failure) })
+          },
+          mask: () => { ssidMask?.toggle() },
+          // 对照模式：收起自绘标题栏、放回被接管的页面原件，用来看 DSH 原样。
+          contrast: () => {
+            const target = currentMainWindow()
+            if (target !== undefined) toggleSsidContrast(target)
+          },
+          restartApplication: () => { app.relaunch(); quitWithoutConfirmation() },
+          // SSiD：换成非破坏的纯净模式重启（官方那一版会备份并清空 profile patch，
+          // 恢复需要人工处理；这里只少加载层，数据一律不动）。
+          disablePlugins: () => { restartInSafeMode() },
+        } })
     } catch (error) { console.warn('desktop tray: unavailable', error) }
+  }
+  // SSiD 全局快捷键：遮罩与截图，键位取自 `~/.ssid/notify.json`、`~/.ssid/screenshot.json`。
+  // 官方壳的 shortcuts 模块管窗口内快捷键，与全局键不重叠；这里只注册这两个，
+  // 因此退出时整体注销是安全的。快捷键是便利功能而非启动前提——键位被占、配置读不出来、
+  // 或运行环境根本没有这个 API 时都只降级：托盘里都有等价入口，不该拖着整个启动一起失败。
+  if (process.platform === 'win32') {
+    try {
+      const { hotkey } = readSsidMaskConfig()
+      if (hotkey !== '' && !globalShortcut.register(hotkey, () => { ssidMask?.toggle() })) {
+        console.warn(`desktop mask: hotkey ${hotkey} is already taken; use the tray item instead`)
+      }
+      const { hotkey: shotHotkey } = readSsidScreenshotConfig()
+      if (shotHotkey !== '' && ssidScreenshot?.registerHotkeyAtStartup() !== true) {
+        console.warn(`desktop screenshot: hotkey ${shotHotkey} is already taken`)
+      }
+      app.on('will-quit', () => { globalShortcut.unregisterAll() })
+    } catch (error) { console.warn('desktop shortcuts: global hotkeys unavailable', error) }
   }
   const backgroundNotice = process.platform === 'win32'
     ? new DesktopBackgroundNotice({ markerPath: join(app.getPath('userData'), 'background-close-confirmed'),
@@ -1022,7 +1310,9 @@ async function main(): Promise<void> {
       // Empty colors precede client stylesheet installation; only CSS color values cross IPC.
       const validColor = (value: unknown): value is string => typeof value === 'string'
         && /^(?:#[\da-f]{3,8}|rgba?\([\d.,%\s]+\))$/iu.test(value)
-      if (validColor(color) && validColor(symbolColor)) mainWindow.setTitleBarOverlay({ color, symbolColor })
+      // SSiD：没有 titleBarOverlay 可更新（上游在此调 `setTitleBarOverlay`，删掉 overlay 后
+      // 该调用会抛 `Titlebar overlay is not enabled`），页面实测的调色板改为刷新自绘标题栏。
+      if (validColor(color) && validColor(symbolColor)) applySsidTitlebarTheme(mainWindow, color, symbolColor)
     })
   }
 

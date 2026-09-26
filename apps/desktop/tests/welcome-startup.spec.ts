@@ -70,7 +70,10 @@ vi.mock('electron', () => ({
     constructor(options: BrowserWindowConstructorOptions) { state.windowOptions = options }
     private ready: (() => void) | undefined
     webContents = { mainFrame: { url: 'dsh-app://app/' }, setWindowOpenHandler: vi.fn(),
-      on: vi.fn(), once: vi.fn(), send: vi.fn(), openDevTools: state.openDevTools }
+      on: vi.fn(), once: vi.fn(), send: vi.fn(), openDevTools: state.openDevTools,
+      // SSiD 自绘标题栏装配时读这两个：`isLoading` 决定要不要立刻注入，注入本身走
+      // `executeJavaScript`（见 src/ssid/titlebar.ts）。
+      isLoading: () => false, executeJavaScript: vi.fn(async () => undefined) }
     static getAllWindows() { return [] }
     once(name: string, callback: () => void) { if (name === 'ready-to-show') this.ready = callback; return this }
     on() { return this }

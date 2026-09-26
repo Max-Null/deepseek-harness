@@ -43,6 +43,16 @@ import {
  * @param {string | undefined} preparedRuntimeVersion - Version that private tree declares, which qualification rewrites away from the product version.
  * @returns {object} electron-builder configuration.
  */
+/**
+ * SSiD 产品名。
+ *
+ * electron-builder 用它命名产物（`思灵.exe` / `思灵.app`），而 `scripts/` 下的打包
+ * 与冒烟脚本要按同名去找这些文件 —— 所以做成单一来源：只在这里改一次，
+ * `smoke-packaged-runtime.ts` / `package-target.ts` / `package-macos.ts` /
+ * `development-app.ts` 全部从它取，避免以后再出现「改了名字、脚本找不到产物」。
+ */
+export const DESKTOP_PRODUCT_NAME = '思灵'
+
 export function createElectronBuilderConfig(
   env = process.env,
   hostPlatform = process.platform,
@@ -99,14 +109,14 @@ export function createElectronBuilderConfig(
   const packaged = resolveDesktopBuildCommit(env)
   return {
     appId,
-    protocols: [{ name: 'DeepSeek Harness', schemes: ['dsh'] }],
+    protocols: [{ name: '思灵', schemes: ['dsh'] }],
     extraMetadata: {
       dshDesktopAppId: appId,
       dshMandatoryUpdatePolicy: policy,
       ...buildVersion === productVersion ? {} : { version: buildVersion },
       ...packaged === undefined ? {} : { dshBuildCommit: packaged.commit, dshBuildDirty: packaged.dirty },
     },
-    productName: 'DeepSeek Harness',
+    productName: DESKTOP_PRODUCT_NAME,
     // Unsigned builds carry their own suffix so a shared file can never pass for a release artifact.
     artifactName: `deepseek-harness-\${version}-\${os}-\${arch}${unsigned ? '-unsigned' : ''}.\${ext}`,
     directories: { output: unsigned ? buildPaths.unsignedArtifacts : buildPaths.artifacts },
@@ -128,10 +138,12 @@ export function createElectronBuilderConfig(
     },
     files: [
       'lib/main.js',
+      'lib/screenshot.html',
       'lib/welcome/**/*',
       'lib/preload-app.cjs',
       'lib/preload-mandatory.cjs',
       'lib/preload-platform-account.cjs',
+      'lib/preload-screenshot.cjs',
       'lib/preload-update-dialog.cjs',
       'lib/preload-welcome.cjs',
       'renderer/**/*',
@@ -143,6 +155,10 @@ export function createElectronBuilderConfig(
     asarUnpack: unpack,
     extraResources: [
       { from: buildPaths.runtime, to: 'runtime' },
+      // SSiD：随包插件集。壳在首启把它接进 profile（建目录链接 + 补 bundles 声明），
+      // 插件本体与它的 client 半都从 profile 解析 —— 见 apps/desktop/src/ssid/profile-seed.ts。
+      // 由 `prepare:ssid-plugins` 产出；缺了这一目录 electron-builder 会因为 `from` 不存在而失败。
+      { from: join(buildPaths.root, 'ssid-plugins'), to: 'ssid-plugins' },
       { from: fileURLToPath(new URL('../resources/icon-windows.png', import.meta.url)), to: 'icon.png' },
       // Windows tray bitmaps; macOS keeps the Dock and ships no menu bar icon.
       ...(packagesWindows ? [{ from: fileURLToPath(new URL('../resources/tray-windows.ico', import.meta.url)), to: 'tray.ico' }] : []),
@@ -150,16 +166,23 @@ export function createElectronBuilderConfig(
     mac: {
       icon: fileURLToPath(new URL('../resources/icon-macos.png', import.meta.url)),
       category: 'public.app-category.developer-tools',
-      // macOS matches the application locale against this bundle, not Electron Framework resources.
-      extendInfo: { CFBundleLocalizations: ['en', 'zh_CN'] },
-      identity: macOSSigning?.signingIdentity,
+      // SSiD：没配签名身份时退回 ad-hoc（`-`）。与自建壳的 mac 打包一致 ——
+      // 本地与 CI 都不需要 Apple 开发者账号也能出可运行的包，只是分发时会被
+      // Gatekeeper 拦（与 Windows 侧「不买证书、接受 SmartScreen」同一取舍）。
+      identity: macOSSigning?.signingIdentity ?? '-',
       forceCodeSigning: true,
       hardenedRuntime: true,
-      extendInfo: { NSMicrophoneUsageDescription: 'DeepSeek Harness uses your microphone to transcribe speech into message drafts.' },
+      // macOS matches the application locale against this bundle, not Electron Framework resources.
+      extendInfo: {
+        CFBundleLocalizations: ['en', 'zh_CN'],
+        NSMicrophoneUsageDescription: `${DESKTOP_PRODUCT_NAME} 使用麦克风把语音转写为消息草稿。`,
+      },
       entitlements: fileURLToPath(new URL('./macos-entitlements.plist', import.meta.url)),
       entitlementsInherit: fileURLToPath(new URL('./macos-entitlements.plist', import.meta.url)),
       // ASAR-unpacked native runtime files are pre-signed; PAK resources are sealed by their enclosing bundle.
-      signIgnore: ['/Contents/Resources/app\\.asar\\.unpacked/dsh(?:/|$)', '/Contents/Resources/runtime/primary-runtime(?:/|$)', '\\.pak$'],
+      // SSiD：插件集里带着从 GitHub release 下载的二进制（codegraph 引擎），与 runtime/primary-runtime 同理
+      // 不在这里签。**macOS 侧尚未验证** —— 公证可能拒绝这些第三方二进制。
+      signIgnore: ['/Contents/Resources/app\\.asar\\.unpacked/dsh(?:/|$)', '/Contents/Resources/runtime/primary-runtime(?:/|$)', '/Contents/Resources/ssid-plugins(?:/|$)', '\\.pak$'],
       notarize: true,
       target: ['dmg', 'zip'],
     },
@@ -246,6 +269,12 @@ export function createElectronBuilderConfig(
       differentialPackage: true,
     },
     detectUpdateChannel: false,
-    publish: update === undefined ? null : [{ provider: 'generic', url: update.publicUrl, channel: 'nightly' }],
+    // SSiD：官方在有 COS 凭据时用 generic provider 指向腾讯 COS，未签名构建则写 null，
+    // 让产物不带任何更新元数据。思灵不买签名证书（构建恒为 unsigned），但仍要自动更新，
+    // 于是未签名分支改指公开的 GitHub Releases —— 代价是更新包没有签名校验，这是
+    // 「不签名」这一决定本身的既有代价，不是新增的。配了 COS 的构建仍按原样走 generic。
+    publish: update === undefined
+      ? [{ provider: 'github', owner: 'Max-Null', repo: 'seek-soul-in-darkness' }]
+      : [{ provider: 'generic', url: update.publicUrl, channel: 'nightly' }],
   }
 }
