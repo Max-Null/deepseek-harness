@@ -158,7 +158,11 @@ export function createElectronBuilderConfig(
       // SSiD：随包插件集。壳在首启把它接进 profile（建目录链接 + 补 bundles 声明），
       // 插件本体与它的 client 半都从 profile 解析 —— 见 apps/desktop/src/ssid/profile-seed.ts。
       // 由 `prepare:ssid-plugins` 产出；缺了这一目录 electron-builder 会因为 `from` 不存在而失败。
+      // 插件实体（584 个包）单独挂一条：electron-builder 会丢掉源目录**顶层**的 node_modules，
+      // 只复制到同级的 ssid-plugins.json —— 壳随后按 manifest 建链接就会指向空目录。
       { from: join(buildPaths.root, 'ssid-plugins'), to: 'ssid-plugins' },
+      // electron-builder excludes a source directory's root node_modules.
+      { from: join(buildPaths.root, 'ssid-plugins', 'node_modules'), to: 'ssid-plugins/node_modules', filter: ['**/*'] },
       { from: fileURLToPath(new URL('../resources/icon-windows.png', import.meta.url)), to: 'icon.png' },
       // Windows tray bitmaps; macOS keeps the Dock and ships no menu bar icon.
       ...(packagesWindows ? [{ from: fileURLToPath(new URL('../resources/tray-windows.ico', import.meta.url)), to: 'tray.ico' }] : []),
