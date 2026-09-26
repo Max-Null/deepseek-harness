@@ -185,11 +185,9 @@ export async function createDesktopUploadPlan(
   const repositoryRoot = options.repositoryRoot ?? REPOSITORY_ROOT
   const appRoot = options.appRoot ?? APP_ROOT
   const artifactsRoot = options.artifactsRoot ?? desktopTargetBuildPaths(targetName).artifacts
-  const dshVersion = await manifestVersion(join(repositoryRoot, 'package.json'), 'dsh package')
+  // 校验基准是思灵自己的产品版本 —— 自 1.0.0 起它与内嵌的 dsh 版本独立，
+  // 发版记录里写的也是产品版本（见 package-target.ts 的 writeReleaseRecord）。
   const desktopVersion = await manifestVersion(join(appRoot, 'package.json'), 'desktop package')
-  if (dshVersion !== desktopVersion) {
-    throw new Error(`desktop upload: desktop version ${desktopVersion} does not match current dsh version ${dshVersion}`)
-  }
 
   const update = resolveDesktopUploadConfig(environment, target.platform, target.arch)
   const buildRecord = await jsonFile(
@@ -200,10 +198,10 @@ export async function createDesktopUploadPlan(
   const recordedVersion = stringField(buildRecord.version, `${targetName} package completion record.version`)
   let buildVersion: string
   try {
-    buildVersion = validateDesktopBuildVersion(recordedVersion, dshVersion)
+    buildVersion = validateDesktopBuildVersion(recordedVersion, desktopVersion)
   }
   catch (error) {
-    throw new Error(`desktop upload: ${targetName} package completion record holds ${recordedVersion}, which is not a build of dsh ${dshVersion}: ${
+    throw new Error(`desktop upload: ${targetName} package completion record holds ${recordedVersion}, which is not a build of ${desktopVersion}: ${
       error instanceof Error ? error.message : String(error)}`)
   }
   if (buildRecord.schemaVersion !== 1
