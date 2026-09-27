@@ -38,7 +38,7 @@ import { SsidScreenshot, readSsidScreenshotConfig } from './ssid/screenshot.ts'
 import { createKeepAwake, readKeepAwakeConfig, type KeepAwake } from './ssid/keep-awake.ts'
 import { recordCodeGraphDecision, shouldGuideCodeGraph } from './ssid/codegraph-guide.ts'
 import { installSsidMcpEnv } from './ssid/mcp-env.ts'
-import { resolveProfileName } from './ssid/profile-name.ts'
+import { installSessionRootEnv, resolveProfileName } from './ssid/profile-name.ts'
 import { seedSsidProfile } from './ssid/profile-seed.ts'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { resolveDesktopPaths } from './paths.ts'
@@ -677,6 +677,11 @@ async function main(): Promise<void> {
         console.log(`ssid: mcp ready (playwright=${String(mcpEnv.playwrightCli)}`
           + ` codegraph=${String(mcpEnv.codegraphCli)} ws=${mcpEnv.codegraphWorkspace ?? '(none)'}`
           + ` enabled=${mcpEnv.codegraphEnabled})`)
+        // SSiD 会话根：`dsh-ssid-panels` 靠这对环境变量启用会话隔离，缺席即退回官方
+        // 基础层的共享根 —— 隔离根里的历史会话会整个看不见。与 MCP env 同理，
+        // 必须在 host.start() 之前注入（子进程继承当时的 process.env）。
+        const sessionRoots = installSessionRootEnv(resolveDshHome(), resolveProfileName())
+        console.log(`ssid: session roots isolated=${sessionRoots.isolated} shared=${sessionRoots.shared}`)
         const ready = await host.start()
         hostCookie = await authenticateWebHost(ready.url)
         hostUrl = ready.url
