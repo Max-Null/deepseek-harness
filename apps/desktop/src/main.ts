@@ -204,6 +204,23 @@ function runtimeResources(): RuntimeResources {
 }
 
 /**
+ * DSH 内核版本，与产品版本（`app.getVersion()`）彼此独立。
+ *
+ * 官方实现里产品就是 DSH，壳各处因此直接用 `app.getVersion()`；SSiD 解耦产品版本后，
+ * 那里取到的已经是思灵的版本号。内核版本只从 runtime 发布记录读 —— 它的 `release.version`
+ * 等于 `@deepseek-ai/dsh` 的版本，打包版在 `resources/dsh`，开发期在 `prepare:dsh` 生成的开发 runtime。
+ * @returns DSH 版本号；runtime 缺失时回退应用版本并告警。
+ */
+function resolveDshVersion(): string {
+  try {
+    return readDesktopRuntime(runtimeResources().dsh).release.version
+  } catch (error: unknown) {
+    console.warn(`ssid: cannot read the DSH runtime version (${String(error)}); falling back to the application version`)
+    return app.getVersion()
+  }
+}
+
+/**
  * 随包插件集根目录（A′ 交付形态的实体来源）。
  *
  * 打包版固定在 `resources/ssid-plugins`；开发期用 `SSID_PLUGIN_SET_DIR` 覆盖 ——
@@ -394,7 +411,7 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
   if (process.platform === 'win32' && primary) {
     installSsidTitlebar(window, {
       productName: SSID_PRODUCT_NAME,
-      dshVersion: app.getVersion(),
+      dshVersion: resolveDshVersion(),
       // 运行形态徽章只在非打包运行时出现，正式版不给自己加噪。
       shellMode: app.isPackaged ? undefined : 'DEV',
     })
@@ -1561,7 +1578,7 @@ async function main(): Promise<void> {
     let wasBlocking = false
     mandatoryPolicy = new DesktopMandatoryUpdatePolicy(policyConfig, {
       platform: process.platform as 'win32' | 'darwin', arch: process.arch as 'x64' | 'arm64',
-      bundledDshVersion: app.isPackaged ? readDesktopRuntime(resources.dsh).release.version : app.getVersion(),
+      bundledDshVersion: resolveDshVersion(),
     }, (state) => {
       if (state.error !== 'authentication-required') policyAuthenticationQueued = false
       if (state.blocking) {
