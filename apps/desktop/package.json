@@ -28,6 +28,7 @@
     "restore:mac-proxy": "tsx scripts/macos-notarization-proxy.ts",
     "package:dir": "tsx scripts/package-target.ts --dir",
     "package:mac:arm64": "tsx scripts/package-target.ts mac-arm64",
+    "package:mac:arm64:unsigned": "tsx scripts/package-target.ts mac-arm64 --unsigned",
     "package:mac:arm64:dir": "tsx scripts/package-target.ts mac-arm64 --dir",
     "package:mac:x64": "tsx scripts/package-target.ts mac-x64",
     "package:mac:x64:dir": "tsx scripts/package-target.ts mac-x64 --dir",
