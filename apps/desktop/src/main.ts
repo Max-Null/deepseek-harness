@@ -38,7 +38,11 @@ import { SsidScreenshot, readSsidScreenshotConfig } from './ssid/screenshot.ts'
 import { createKeepAwake, readKeepAwakeConfig, type KeepAwake } from './ssid/keep-awake.ts'
 import { recordCodeGraphDecision, shouldGuideCodeGraph } from './ssid/codegraph-guide.ts'
 import { installSsidMcpEnv } from './ssid/mcp-env.ts'
-import { installSessionRootEnv, resolveProfileName } from './ssid/profile-name.ts'
+import { migrateLegacyProfile, restoreCarriedPlugins, type CarriedPlugin } from './ssid/profile-migrate.ts'
+import { resolveProfileName } from './ssid/profile-name.ts'
+import { applySessionRootIsolation } from './ssid/session-root.ts'
+import { healWorkspaceRegistry } from './ssid/session-registry-heal.ts'
+import { killPackagedChildProcesses } from './ssid/child-process-cleanup.ts'
 import { seedSsidProfile } from './ssid/profile-seed.ts'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { resolveDesktopPaths } from './paths.ts'
@@ -240,19 +244,41 @@ function resolvePluginSetRoot(): string {
  * 但 `missing` 必须报出来 —— 内核遇到解析不到的插件是**静默跳过**的
  * （实测：只有渲染进程的 client 清单里少一行，`Failed to load plugins` 一次都不出现）。
  * @param profileDir - 当前 profile 目录。
+ * @param carried - 换代时从旧 profile 抢救出来的自装插件（见 `ssid/profile-migrate.ts`）。
  */
-function seedProfilePlugins(profileDir: string): void {
+function seedProfilePlugins(profileDir: string, carried: readonly CarriedPlugin[] = []): void {
+  const log = (text: string): void => { console.log(`ssid: ${text}`) }
   try {
-    const summary = seedSsidProfile({
-      profileDir,
-      pluginSetRoot: resolvePluginSetRoot(),
-      log: (text: string) => { console.log(`ssid: ${text}`) },
-    })
+    const summary = seedSsidProfile({ profileDir, pluginSetRoot: resolvePluginSetRoot(), log })
     if (summary.missing.length > 0) {
       console.error(`ssid: plugin set incomplete — declared but not shipped: ${summary.missing.join(', ')}`)
     }
+    // 骨架这时才建好，换代抢救出来的自装插件在这里补声明。
+    restoreCarriedPlugins(profileDir, carried, log)
   } catch (error) {
     console.error(`ssid: plugin set seed failed: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+/**
+ * 跨界升级的旧 profile 换代（实现见 `ssid/profile-migrate.ts`）。
+ *
+ * 必须在 `manager.applyRelease()` **之前**调用 —— 那一步只在 profile 缺骨架时才写文件，
+ * 先把旧 profile 改名让路，它才会建成新的。
+ *
+ * 换代不成不该挡住启动：代价是回到「手工改名 profile」，而不是应用起不来。这里是唯一
+ * 需要兜住异常的地方 —— `resolvePluginSetRoot()` 在无 Electron 的环境里取不到资源目录。
+ * @param profileDir - 当前 profile 目录（`resolveDesktopPaths()` 的产物）。
+ * @returns 需要在新 profile 里补声明的自装插件；未换代或失败时为空。
+ */
+function migrateProfileIfLegacy(profileDir: string): readonly CarriedPlugin[] {
+  try {
+    return migrateLegacyProfile(profileDir, resolvePluginSetRoot(), (text) => {
+      console.log(`ssid: ${text}`)
+    }).carried
+  } catch (error) {
+    console.error(`ssid: profile migrate failed: ${error instanceof Error ? error.message : String(error)}`)
+    return []
   }
 }
 
@@ -677,11 +703,23 @@ async function main(): Promise<void> {
         console.log(`ssid: mcp ready (playwright=${String(mcpEnv.playwrightCli)}`
           + ` codegraph=${String(mcpEnv.codegraphCli)} ws=${mcpEnv.codegraphWorkspace ?? '(none)'}`
           + ` enabled=${mcpEnv.codegraphEnabled})`)
-        // SSiD 会话根：`dsh-ssid-panels` 靠这对环境变量启用会话隔离，缺席即退回官方
-        // 基础层的共享根 —— 隔离根里的历史会话会整个看不见。与 MCP env 同理，
-        // 必须在 host.start() 之前注入（子进程继承当时的 process.env）。
-        const sessionRoots = installSessionRootEnv(resolveDshHome(), resolveProfileName())
-        console.log(`ssid: session roots isolated=${sessionRoots.isolated} shared=${sessionRoots.shared}`)
+        // SSiD 会话根隔离：env 注入 + profile patch 覆盖内核 root + 回写 applied，三层
+        // 缺一不可 —— 只注入 env 时内核仍读官方基础层的共享根，隔离根里的历史会话会
+        // 整个看不见（见 ssid/session-root.ts 的文件头）。与 MCP env 同理，必须在
+        // host.start() 之前（子进程继承当时的 process.env）。
+        const sessionRoots = applySessionRootIsolation(resolveDshHome(), activeProject, resolveProfileName())
+        console.log(`ssid: session roots isolated=${sessionRoots.isolatedRoot} shared=${sessionRoots.sharedRoot}`
+          + ` enabled=${String(sessionRoots.isolated)} patch=${sessionRoots.patch.reason}`)
+        // 换根自愈：登记一旦与根脱节，侧栏会话全掉「未分组」、工作区看着是空的，而
+        // DSH 自己的 bootstrap 只在 initialized === false 时跑过一次，此后没有兜底
+        // （见 ssid/session-registry-heal.ts 的文件头）。必须在 host.start() 之前 ——
+        // 内核起来时就已读走 workspace.json。
+        const healed = healWorkspaceRegistry({
+          dshHome: resolveDshHome(),
+          log: (text) => { console.log(`ssid: ${text}`) },
+        })
+        console.log(`ssid: registry heal healed=${String(healed.healed)} reason=${healed.reason}`
+          + ` added=${String(healed.added)} created=${String(healed.workspacesCreated)}`)
         const ready = await host.start()
         hostCookie = await authenticateWebHost(ready.url)
         hostUrl = ready.url
@@ -803,9 +841,10 @@ async function main(): Promise<void> {
     startup ??= (async () => {
       await navigateMain(applicationUrl)
       await backend.start(async () => {
+        const carried = migrateProfileIfLegacy(activeProject)
         await manager.applyRelease()
         // 官方这一步只建 profile 骨架（不装包），思灵的插件集由 seed 接入。
-        seedProfilePlugins(manager.paths.profile)
+        seedProfilePlugins(manager.paths.profile, carried)
       })
       if (backend.host !== undefined) await openInitialWindow()
       // 窗口真的显示出来之后再问 CodeGraph 目录；**不 await** —— 它只影响下次启动，
@@ -1170,6 +1209,8 @@ async function main(): Promise<void> {
     updateSchedule.dispose()
     powerMonitor.off('resume', automaticCheck)
     updates.dispose()
+    // 最后一道：随包 node 子进程（MCP 引擎）可能已是孤儿，留着会挡住下次覆盖安装。
+    killPackagedChildProcesses(process.resourcesPath)
   })
 
   const applicationIconPath = development ? join(app.getAppPath(), 'resources', 'icon-windows.png')
