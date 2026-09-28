@@ -142,7 +142,9 @@ it.each([undefined, '2'])('passes macOS pack concurrency %s only to workspace pa
   expect(packs).toHaveLength(2)
   for (const call of packs) expect(call[2].slice(-2)).toEqual(['--concurrency', concurrency ?? '4'])
   for (const call of calls) {
-    expect(call[3].env.HTTP_PROXY).toBe(/^run prepare:(?:runtime|dsh)$/u.test(call[0]) ? 'http://downloads.example:8080' : undefined)
+    // SSiD 新增了 prepare:ssid-plugins 阶段，它与 runtime/dsh 一样走下载路由（要拉 npm 包），
+    // 因此也在带代理的那批里。
+    expect(call[3].env.HTTP_PROXY).toBe(/^run prepare:(?:runtime|dsh|ssid-plugins)$/u.test(call[0]) ? 'http://downloads.example:8080' : undefined)
   }
   expect(withMacOSNotarizationProxy).not.toHaveBeenCalled()
 })
