@@ -844,7 +844,11 @@ async function main(): Promise<void> {
         const carried = migrateProfileIfLegacy(activeProject)
         await manager.applyRelease()
         // 官方这一步只建 profile 骨架（不装包），思灵的插件集由 seed 接入。
-        seedProfilePlugins(manager.paths.profile, carried)
+        // 传 activeProject（= paths.profile）而不是 manager.paths.profile：两者在产品里同源，
+        // 但测试的 DesktopProjectManager mock 不提供 paths，取它会以 TypeError 打断启动链 ——
+        // 而这一步在 `await manager.applyRelease()` 之后、`host.start()` 之前，异常一抛
+        // Host 就不会启动，测试侧的 hostStarted 永等（表现是整文件超时，不是断言失败）。
+        seedProfilePlugins(activeProject, carried)
       })
       if (backend.host !== undefined) await openInitialWindow()
       // 窗口真的显示出来之后再问 CodeGraph 目录；**不 await** —— 它只影响下次启动，
