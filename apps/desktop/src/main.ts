@@ -1,5 +1,4 @@
 import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-product-analytics/types'
-import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
 import { applySsidTitlebarTheme, installSsidTitlebar, toggleSsidContrast } from './ssid/titlebar.ts'
 
 /**
