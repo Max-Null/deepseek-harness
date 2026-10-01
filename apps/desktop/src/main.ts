@@ -40,6 +40,7 @@ import { installSsidMcpEnv } from './ssid/mcp-env.ts'
 import { migrateLegacyProfile, restoreCarriedPlugins, type CarriedPlugin } from './ssid/profile-migrate.ts'
 import { resolveProfileName } from './ssid/profile-name.ts'
 import { applySessionRootIsolation } from './ssid/session-root.ts'
+import { applyStorageRootIsolation } from './ssid/storage-root.ts'
 import { installSsidShellVersion } from './ssid/shell-version.ts'
 import { healWorkspaceRegistry } from './ssid/session-registry-heal.ts'
 import { killPackagedChildProcesses } from './ssid/child-process-cleanup.ts'
@@ -54,6 +55,7 @@ import { installMicrophonePermissions } from './microphone-permissions.ts'
 import { DesktopBackendController } from './backend-controller.ts'
 import { deliverSsidNotify, describeSsidNotify } from './ssid/notify.ts'
 import { DSH_PRODUCT_NAME, SSID_PRODUCT_NAME } from './ssid/product.ts'
+import { applySsidUserData } from './ssid/user-data.ts'
 import { DESKTOP_IPC, SCHEME, assertDesktopSender, type DesktopUpdateState } from './ipc.ts'
 import { readDeviceInfo } from './device-info.ts'
 import { desktopUpdateReadyConfirmation, formatDesktopMessage, resolveDesktopLocale, resolveDesktopStartupLocale } from './locale.ts'
@@ -102,6 +104,11 @@ let windowsLanguage: string | undefined
 let backendReady = false
 /** Error-level console output of the primary window, attached to crash reports. */
 const rendererConsole = new RendererConsoleTail()
+
+// 让出官方桌面版的默认 userData：两者 app.name 同为包名，不改则单实例锁互斥，
+// 官方桌面版无法与思灵并存（成因见 ssid/user-data.ts）。必须早于下面两行 ——
+// 日志落点按 userData 解析。
+applySsidUserData(app)
 
 // Platform-conventional logs directory (macOS ~/Library/Logs/<name>, otherwise under userData);
 // set before ready so the first fatal report already resolves under it.
@@ -829,11 +836,20 @@ async function main(): Promise<void> {
     const sessionRoots = applySessionRootIsolation(resolveDshHome(), activeProject, resolveProfileName())
     console.log(`ssid: session roots isolated=${sessionRoots.isolatedRoot} shared=${sessionRoots.sharedRoot}`
       + ` enabled=${String(sessionRoots.isolated)} patch=${sessionRoots.patch.reason}`)
+    // SSiD 存储根隔离：官方桌面版与思灵共用 home 时，两边的内核 storage 服务会开同一批
+    // unit 并各自**全量重写**整份文件（workspace / schedule…），后写的一方把对方那一份
+    // 整个盖掉 —— 实测跑过一次官方版，思灵的会话登记从 297 条掉到 131 条
+    // （见 ssid/storage-root.ts 的文件头）。
+    const storageRoot = applyStorageRootIsolation(resolveDshHome(), activeProject, resolveProfileName())
+    console.log(`ssid: storage root isolated=${storageRoot.root} shared=${storageRoot.sharedRoot}`
+      + ` patch=${storageRoot.patch.reason} migrated=${String(storageRoot.migrated.length)}`)
     // 换根自愈：登记一旦与根脱节，侧栏会话全掉「未分组」、工作区看着是空的，而 DSH 自己的
     // bootstrap 只在 initialized === false 时跑过一次，此后没有兜底
     // （见 ssid/session-registry-heal.ts 的文件头）。内核起来时就已读走 workspace.json。
+    // storageRoot 必须显式传：自愈要改的是内核正在读写的那一份登记，不是旧根那份。
     const healed = healWorkspaceRegistry({
       dshHome: resolveDshHome(),
+      storageRoot: storageRoot.root,
       log: (text) => { console.log(`ssid: ${text}`) },
     })
     console.log(`ssid: registry heal healed=${String(healed.healed)} reason=${healed.reason}`
@@ -1627,10 +1643,13 @@ async function main(): Promise<void> {
     window.focus()
   }
 
-  if (app.isPackaged || process.env.DSH_DESKTOP_DEV_APP === '1') app.setAsDefaultProtocolClient('dsh')
+  // `dsh://` 让给官方桌面版：两者是同一份上游代码、注册同一个协议名，而 Windows 的
+  // `setAsDefaultProtocolClient` 每次启动都会重写 `HKCU\Software\Classes\dsh` —— 谁后
+  // 启动谁抢走，从外部唤起时打开哪个应用是不确定的。思灵改用自有协议名，两边互不覆盖。
+  if (app.isPackaged || process.env.DSH_DESKTOP_DEV_APP === '1') app.setAsDefaultProtocolClient('ssid')
   app.on('open-url', (event, url) => {
     event.preventDefault()
-    if (url === 'dsh://open' || url === 'dsh://open/') focusPrimaryWindow()
+    if (url === 'ssid://open' || url === 'ssid://open/') focusPrimaryWindow()
   })
 
   app.on('activate', (_event, hasVisibleWindows) => {
