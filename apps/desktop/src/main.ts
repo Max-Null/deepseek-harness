@@ -59,6 +59,7 @@ import { readDeviceInfo } from './device-info.ts'
 import { desktopUpdateReadyConfirmation, formatDesktopMessage, resolveDesktopLocale, resolveDesktopStartupLocale } from './locale.ts'
 import { claimDesktopSingleInstance } from './single-instance.ts'
 import { DesktopUpdateCoordinator } from './update-coordinator.ts'
+import { DesktopCommandManager } from './command-management.ts'
 import { serveWebDocument, authenticateWebHost, forwardWebRequest } from './web-document.ts'
 import { DesktopFatalRecovery } from './fatal-recovery.ts'
 import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
@@ -70,6 +71,7 @@ import { DesktopUpdatePreparationError } from './update-error.ts'
 import { DesktopUpdateSchedule, resolveDesktopUpdateScheduleConfig } from './update-schedule.ts'
 import { desktopUpdateErrorSummary, presentDesktopUpdate } from './update-presentation.ts'
 import { desktopErrorState } from './startup-error.ts'
+import { readDesktopLoginShellEnvironment, resolveDesktopLoginShellConfig } from './login-shell-environment.ts'
 import { DesktopMandatoryUpdatePolicy, resolveDesktopPolicyConfig, type DesktopPolicyState } from './mandatory-update-policy.ts'
 import { desktopClientMetadata, desktopClientVersion } from './client-metadata.ts'
 import { DesktopMandatoryUpdateWindow } from './mandatory-update-window.ts'
@@ -557,6 +559,17 @@ async function main(): Promise<void> {
     : join(process.resourcesPath, 'runtime', 'primary-runtime')
   const activeProject = paths.profile
   const manager = new DesktopProjectManager(paths, resources)
+  // Dock and Finder launches inherit only launchd's environment; every Host shares one login-shell read.
+  const loginShellRead = new AbortController()
+  // The probe runs in its own process group, which outlives Desktop unless the read is aborted.
+  app.on('will-quit', () => { loginShellRead.abort() })
+  const loginShell = readDesktopLoginShellEnvironment(process.env, resolveDesktopLoginShellConfig(process.env), {
+    signal: loginShellRead.signal,
+  }).then((result) => {
+    for (const failure of result.failures) console.warn(`desktop login shell: ${failure.shell} failed (${failure.reason})`)
+    return result.environment
+  })
+  let hostEnvironment: NodeJS.ProcessEnv = process.env
   let quitting = false
   let startup: Promise<void> | undefined
   let workspaceRecovery: Promise<void> | undefined
@@ -607,6 +620,15 @@ async function main(): Promise<void> {
       detail: formatDesktopMessage(locale.messages.aboutVersion, { version: app.getVersion() }),
       buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
   }
+  const commandManager = new DesktopCommandManager({
+    resources: process.resourcesPath,
+    isPackaged: app.isPackaged,
+    isInstalledLocation: () => process.platform !== 'darwin' || app.isInApplicationsFolder(),
+    isInstalling: () => updateState.phase === 'installing',
+    isQuitting,
+    messages: () => currentDesktopLocale().messages,
+    show: ordinaryMessageBox,
+  })
   const appPreload = fileURLToPath(new URL('./preload-app.cjs', import.meta.url))
   const applicationUrl = `${SCHEME}://app/`
   let hostUrl: string | undefined
@@ -654,7 +676,7 @@ async function main(): Promise<void> {
   const backend = new DesktopBackendController((onFailure) => {
     const hostInspectPort = developmentHostInspectPort(development)
     const host = new DesktopHostProcess(resources.node, resources.dsh, activeProject,
-      hostInspectPort, { ...process.env, DSH_CLIENT_VERSION: desktopClientVersion() }, onFailure,
+      hostInspectPort, { ...hostEnvironment, DSH_CLIENT_VERSION: desktopClientVersion() }, onFailure,
       primaryRuntime,
       resources, (next) => { platformView.setSession(next) },
       (event) => { deliverSsidNotify(() => mainWindow, describeSsidNotify(event, SSID_PRODUCT_NAME), event.scene) },
@@ -816,6 +838,12 @@ async function main(): Promise<void> {
     })
     console.log(`ssid: registry heal healed=${String(healed.healed)} reason=${healed.reason}`
       + ` added=${String(healed.added)} created=${String(healed.workspacesCreated)}`)
+    // 上游 0.2.0-rc.2 起：Dock/Finder 启动只继承 launchd 的环境，这里用登录 shell 补齐
+    // （POSIX-only；Windows 下退化为 base）。**必须放在最后一步**：`hostEnvironment` 的初值是
+    // `process.env` 的引用，上面三处注入正是靠这层引用才到得了 Host；直接赋值 `loginShell`
+    // 会切断这层关联、让注入全部失效（= 坑 #59 回归）。所以用 process.env 的当前值覆盖同名键。
+    const loginEnvironment = await loginShell
+    hostEnvironment = { ...loginEnvironment, ...process.env }
   }
 
   const publishUpdate = (state: DesktopUpdateState): DesktopUpdateState => {
@@ -831,8 +859,8 @@ async function main(): Promise<void> {
       updateStoppedHost = false
       if (restoreHost) {
         // Only confirmed process exit permits replacement before another installation confirmation.
-        // 环境准备必须先完成：新 Host 是在 `backend.start()` 内部构造的，env 到那时已定型。
-        const hostReady = prepareHostEnvironment().then(() => backend.start(async () => {}))
+        // 环境准备走 `backend.start(prepare)` 的 prepare 阶段 —— 同样先于 spawn，不必在外面 await。
+        const hostReady = backend.start(prepareHostEnvironment)
         startup = hostReady
         const recovery = hostReady.then(async () => {
           if (quitting) return
@@ -861,17 +889,27 @@ async function main(): Promise<void> {
   const reconcileBackend = (): Promise<void> => {
     startup ??= (async () => {
       await navigateMain(applicationUrl)
-      // 必须在 `backend.start()` 之前：host 在它内部构造，env 到那时已定型。
-      await prepareHostEnvironment()
       await backend.start(async () => {
         const carried = migrateProfileIfLegacy(activeProject)
         await manager.applyRelease()
+        // 三处注入放在 prepare 阶段：`backend.start(prepare)` 的契约是 prepare 先于 spawn 完成
+        // （backend-controller.ts:57「Profile preparation that must finish before spawning」），
+        // env 因此仍早于 Host 构造。rc.1 时代没有这条契约，我们才把它提到 `backend.start()` 之外；
+        // 那个写法会让 `backend.start()` 晚调用，依赖 preparing 信号的测试永远等不到它而超时
+        // （2026-10-01 合 rc.2 时发现并撤销该权宜之计）。
+        await prepareHostEnvironment()
         // 官方这一步只建 profile 骨架（不装包），思灵的插件集由 seed 接入。
         // 传 activeProject（= paths.profile）而不是 manager.paths.profile：两者在产品里同源，
         // 但测试的 DesktopProjectManager mock 不提供 paths，取它会以 TypeError 打断启动链 ——
         // 而这一步在 `await manager.applyRelease()` 之后、`host.start()` 之前，异常一抛
         // Host 就不会启动，测试侧的 hostStarted 永等（表现是整文件超时，不是断言失败）。
-        seedProfilePlugins(activeProject, carried)
+        try {
+          seedProfilePlugins(activeProject, carried)
+        } catch (error: unknown) {
+          // 插件集注入失败不挡启动：代价是随包插件缺失（可手工补救），而不是应用起不来。
+          // 与 `migrateProfileIfLegacy` 同一条纪律；测试环境的 profile 是占位路径，会走到这里。
+          console.error(`ssid: seed profile plugins failed: ${desktopErrorState(error).message}`)
+        }
       })
       if (backend.host !== undefined) await openInitialWindow()
       // 窗口真的显示出来之后再问 CodeGraph 目录；**不 await** —— 它只影响下次启动，
@@ -902,6 +940,7 @@ async function main(): Promise<void> {
   const updates = new DesktopUpdateCoordinator(
     publishUpdate,
     async () => {
+      await commandManager.idle()
       await workspaceRecovery
       await startup?.catch(() => undefined)
       const host = backend.host
@@ -951,6 +990,7 @@ async function main(): Promise<void> {
     },
     undefined, undefined, undefined,
     (success, reason) => { void track('desktop_upgrade_download_result', { is_success: success, ...reason === undefined ? {} : { error_reason: reason } }) },
+
   )
 
   const updateSchedule = new DesktopUpdateSchedule(updates, resolveDesktopUpdateScheduleConfig(process.env))
@@ -1278,6 +1318,8 @@ async function main(): Promise<void> {
       : { label: currentDesktopLocale().messages.aboutMenu, role: 'about' },
     { type: 'separator' },
     { label: currentDesktopLocale().messages.checkUpdatesMenu, click: () => { void openUpdatePrompt(true) } },
+    ...process.platform === 'darwin' || process.platform === 'win32'
+      ? [{ label: currentDesktopLocale().messages.cliCommandMenu, click: () => { void commandManager.show() } }] : [],
     ...development ? [
       { type: 'separator' as const },
       { label: currentDesktopLocale().messages.reloadPageMenu, role: 'reload' as const },
