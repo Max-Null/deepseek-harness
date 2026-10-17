@@ -111,6 +111,36 @@ describe('desktop package target', () => {
     expect(desktopElectronBuilderEnvironment(environment, false)).toEqual({ ...environment, DSH_DESKTOP_UNSIGNED: '0' })
   })
 
+  // SSiD：未签名构建不能把 Apple 凭据交给 electron-builder —— ad-hoc 身份从配置来、公证被跳过，
+  // 这些变量只会让 codesign 去找一个不存在的发布证书。
+  it('withdraws Apple signing and notarization inputs from unsigned macOS builds', () => {
+    const environment = {
+      DSH_DESKTOP_TARGET_PLATFORM: 'darwin',
+      DSH_DESKTOP_MACOS_SIGNING_IDENTITY: 'Example Company (TEAMID1234)',
+      DSH_DESKTOP_MACOS_TEAM_ID: 'TEAMID1234',
+      DSH_DESKTOP_MACOS_PACK_CONCURRENCY: '2',
+      DSH_DESKTOP_MACOS_DOWNLOAD_PROXY: 'http://downloads.example:8080',
+      APPLE_ID: 'release@example.com',
+      APPLE_APP_SPECIFIC_PASSWORD: 'app-password',
+      APPLE_TEAM_ID: 'TEAMID1234',
+      APPLE_API_KEY: '/private/credentials/AuthKey_TEST123456.p8',
+      APPLE_API_KEY_ID: 'TEST123456',
+      APPLE_API_ISSUER: '11111111-2222-3333-4444-555555555555',
+      APPLE_KEYCHAIN: '/Users/release/Library/Keychains/release.keychain-db',
+      APPLE_KEYCHAIN_PROFILE: 'release-notary',
+    }
+    // 只有签名与公证输入被撤走；并发与代理是构建参数，仍归这次构建所有。
+    expect(desktopElectronBuilderEnvironment(environment, true)).toEqual({
+      DSH_DESKTOP_TARGET_PLATFORM: 'darwin',
+      DSH_DESKTOP_MACOS_PACK_CONCURRENCY: '2',
+      DSH_DESKTOP_MACOS_DOWNLOAD_PROXY: 'http://downloads.example:8080',
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false',
+      DSH_DESKTOP_UNSIGNED: '1',
+    })
+    // 有签名构建必须原样拿到这些输入：清理一旦写成无条件的，这条就变红。
+    expect(desktopElectronBuilderEnvironment(environment, false)).toEqual({ ...environment, DSH_DESKTOP_UNSIGNED: '0' })
+  })
+
   it.each([false, true])('pins the Windows archive filter for the NSIS decoder (unsigned: %s)', (unsigned) => {
     expect(desktopElectronBuilderEnvironment({
       DSH_DESKTOP_TARGET_PLATFORM: 'win32', ELECTRON_BUILDER_7Z_FILTER: 'ARM64',
