@@ -162,11 +162,13 @@ it('checks macOS directory packages without writing a release record', async () 
 })
 
 // SSiD：未签名 mac 构建一步出产物，既不分解成「先签目录、再各自公证」，也不校验签名。
+// 公证在 electron-builder 配置层按 unsigned 关掉（`notarize: !unsigned && !skipNotarization`），
+// 所以命令行不再额外传 `--config.mac.notarize=false` —— 那只属于签名路径。
 it.each([false, true])('packages an unsigned macOS build without notarization or a release record (directory=%s)', async (directory) => {
   const { run, stages } = supervisor()
   await packageTarget(parseDesktopPackageInvocation(['mac-arm64', '--unsigned', ...(directory ? ['--dir'] : [])], 'darwin', 'arm64'), environment, run)
   expect(stages.filter(stage => stage.startsWith('exec electron-builder'))).toEqual([
-    `exec electron-builder --config electron-builder.config.mjs --mac --arm64 --publish never${directory ? ' --dir' : ''} --config.mac.notarize=false`,
+    `exec electron-builder --config electron-builder.config.mjs --mac --arm64 --publish never${directory ? ' --dir' : ''}`,
   ])
   expect(withMacOSNotarizationProxy).not.toHaveBeenCalled()
   expect(packageMacOSArtifacts).not.toHaveBeenCalled()

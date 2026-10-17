@@ -237,19 +237,6 @@ export function createElectronBuilderConfig(
         preparedRuntimeVersion ?? dshVersion, { platform: resolvedPlatform, arch: resolvedArch })
       // Unsigned Windows builds skip electron-builder's afterSign hook.
       if (packagesWindows && unsigned) await verifyWindowsAsarUnpack(buildPaths.dsh, resourcesDir, windowsCode)
-      // SSiD：未签名 mac 构建在这里自己用 ad-hoc 身份签名。@electron/osx-sign 签完固定跑
-      // `codesign --verify --deep`（该验证关不掉：`mac.strictVerify` 只控制 --strict，`mac.timestamp`
-      // 又被 MacTargetHelper 的 `customSignOptions.timestamp || undefined` 吞回默认 true），实测它在这棵
-      // 含 LibreOfficeDev.app 的巨型 bundle 上必然失败，而同一个 app 事后重跑同一条命令却通过 ——
-      // 产物本身完好（普查 144 个 Mach-O 全部有签名）。所以 unsigned 下让 electron-builder 跳过签名，
-      // 由这里用同一条 codesign 完成，不让一个结果不可复现的验证卡住整条打包链。
-      if (packagesMacOS && unsigned) {
-        await promisify(execFile)('/usr/bin/codesign', [
-          '--force', '--deep', '--sign', '-', '--options', 'runtime',
-          '--entitlements', fileURLToPath(new URL('./macos-entitlements.plist', import.meta.url)),
-          join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`),
-        ])
-      }
     },
     afterSign: async context => {
       if (windowsSigner !== undefined) {
