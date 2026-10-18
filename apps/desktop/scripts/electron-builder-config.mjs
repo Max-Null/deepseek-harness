@@ -187,8 +187,12 @@ export function createElectronBuilderConfig(
       icon: fileURLToPath(new URL('../resources/icon-macos.png', import.meta.url)),
       category: 'public.app-category.developer-tools',
       // Ad-hoc signing keeps the modified Electron executable runnable without a Developer ID.
-      // SSiD：未签名构建落到 ad-hoc 身份 `-`（取舍见上面的凭据解析），有签名构建用发布身份。
-      identity: unsigned ? '-' : macOSSigning?.signingIdentity,
+      // SSiD：未签名构建**不让 electron-builder 签**（identity: null）——它签完会固定跑
+      // `codesign --verify --deep --strict`，而 signIgnore 排除了 runtime/primary-runtime 与
+      // ssid-plugins，里面 python 的 .so、pnpm 的 @reflink 本来就没有签名（普查 141 个 Mach-O
+      // 里 8 个未签），于是 verify 必失败；@electron/osx-sign 又把真正的错因吞成一句 Command failed。
+      // 改由 afterPack 用 ad-hoc 身份对整个 app 做一次 --deep 签名，把那些文件一起带上。
+      identity: unsigned ? null : macOSSigning?.signingIdentity,
       forceCodeSigning: !unsigned,
       hardenedRuntime: true,
       // macOS matches the application locale against this bundle, not Electron Framework resources.
@@ -237,6 +241,14 @@ export function createElectronBuilderConfig(
         preparedRuntimeVersion ?? dshVersion, { platform: resolvedPlatform, arch: resolvedArch })
       // Unsigned Windows builds skip electron-builder's afterSign hook.
       if (packagesWindows && unsigned) await verifyWindowsAsarUnpack(buildPaths.dsh, resourcesDir, windowsCode)
+      // 未签名 macOS：electron-builder 不再签名（identity: null），这里对整包做一次 ad-hoc 深签。
+      // 用 --deep 是为了把 signIgnore 排除掉的那些文件（python 的 .so、pnpm 的 @reflink）一起带上——
+      // 它们没有原生签名，留着就会让后续任何 `codesign --verify --deep` 失败。
+      if (context.electronPlatformName === 'darwin' && unsigned) {
+        const appBundle = join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`)
+        await promisify(execFile)('codesign', ['--sign', '-', '--force', '--deep', '--options', 'runtime',
+          '--entitlements', fileURLToPath(new URL('./macos-entitlements.plist', import.meta.url)), appBundle])
+      }
     },
     afterSign: async context => {
       if (windowsSigner !== undefined) {
