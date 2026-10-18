@@ -187,8 +187,23 @@ export function apply(ctx) {
     console.log('desktop runtime: DOCX, XLSX, PPTX to PDF and skill CLI discovery passed')
   } finally {
     clearTimeout(timer)
-    try { await host.stop() } finally {
-      await rm(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 })
+    // 收尾阶段必须有截止时间：Windows 上 host.stop() 与 rm() 都可能在未完成的
+    // Promise 上停住，而一处停住就会把整条打包链拖死（实测挂过三小时，两次复现）。
+    // 这里各自限时，超时只记诊断并继续 —— 残留进程与目录由下一次运行清理。
+    const deadline = (ms: number): Promise<false> => new Promise((resolve) => {
+      setTimeout(resolve, ms).unref()
+    }).then(() => false as const)
+    try {
+      const stopped = await Promise.race([host.stop().then(() => true as const), deadline(25_000)])
+      if (!stopped) console.error('desktop runtime: host.stop() exceeded 25s; continuing')
+    } catch (error) {
+      console.error('desktop runtime: host.stop() failed', error)
+    } finally {
+      const cleaned = await Promise.race([
+        rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }).then(() => true as const, () => false as const),
+        deadline(30_000),
+      ])
+      if (!cleaned) console.error('desktop runtime: temp home cleanup exceeded 30s; continuing')
     }
   }
 }

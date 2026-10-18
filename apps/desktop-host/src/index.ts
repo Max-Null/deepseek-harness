@@ -58,7 +58,8 @@ async function main(): Promise<void> {
     // 另一方 Host 报 listen EADDRINUSE、只留一个起不来的壳挂着托盘图标）。改用独立端口。
     // 上游改用 `--port 0`（系统分配）同样能避免互斥，但 SSiD 的验收脚本与用户可见的
     // GUI URL 都按固定端口写，动态端口会让这些路径每次都要重新解析，故保留固定值。
-    args: ['--no-open', '--host', '127.0.0.1', '--port', '19388'],
+    // 并行实例（dev 与装版同时跑）需要第二个端口：`DSH_DESKTOP_HOST_PORT` 覆盖默认值。
+    args: ['--no-open', '--host', '127.0.0.1', '--port', process.env.DSH_DESKTOP_HOST_PORT ?? '19388'],
     ...(process.argv[5] === undefined ? {} : {
       packageManager: {
         command: process.execPath,
