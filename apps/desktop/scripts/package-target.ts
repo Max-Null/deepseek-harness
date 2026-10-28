@@ -499,7 +499,9 @@ export async function packageTarget(
   // 插件集（resources/ssid-plugins）不在 prepare:packages 里：模板与 vendor 的改动
   // 只有这一步会落盘。漏掉它会静默打进上一次生成的插件集——exe 正常、能装能跑，
   // 只是里面的插件是旧的，从产物表面完全看不出来（2026-10-18 因此白跑了一轮 28 分钟的打包）。
-  await execute(['run', 'prepare:ssid-plugins'], targetEnv)
+  // 插件集要从 npm 拉随包插件，所以和 prepare:runtime / prepare:dsh 一样走下载路由
+  // （downloadEnv 在 macOS 配了 downloadProxy 时会带上 HTTP_PROXY，targetEnv 不带）。
+  await execute(['run', 'prepare:ssid-plugins'], downloadEnv)
   if (invocation.prepareOnly) return
   if (target.platform === 'darwin' && !invocation.unsigned && !invocation.skipNotarization && !invocation.directory) {
     await execute([

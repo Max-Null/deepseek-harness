@@ -171,7 +171,7 @@ describe('desktop macOS release signature', () => {
     })
   })
 
-  it.each(['arm64', 'x64'])('packages unsigned macOS %s builds with an ad-hoc identity and the GitHub release feed', async (arch) => {
+  it.each(['arm64', 'x64'])('does not let electron-builder sign an unsigned macOS %s build, and points it at the GitHub release feed', async (arch) => {
     const { createElectronBuilderConfig } = await import('../scripts/electron-builder-config.mjs')
     // SSiD：未签名构建不读 Apple 凭据，所以这套只有目标平台的配置必须能构造出 builder 配置。
     const config = createElectronBuilderConfig({
@@ -181,7 +181,11 @@ describe('desktop macOS release signature', () => {
     expect(portablePath(config.directories.output)).toContain(`/targets/mac-${arch}/unsigned-artifacts`)
     // SSiD：产物名前缀是产品名 `ssid-`（官方是 `deepseek-harness-`）。
     expect(config.artifactName).toBe('ssid-${version}-${os}-${arch}-unsigned.${ext}')
-    expect(config.mac).toMatchObject({ identity: '-', forceCodeSigning: false, notarize: false, target: ['dmg'] })
+    // SSiD：未签名构建的 identity 是 null 而不是 ad-hoc 的 `-` —— 不让 electron-builder 签，
+    // 因为它签完会固定跑 `codesign --verify --deep --strict`，而 signIgnore 排除了 runtime 与
+    // ssid-plugins，里面本来就有未签的二进制（普查 141 个 Mach-O 里 8 个未签），verify 必失败。
+    // ad-hoc 签名改由 afterPack 对整个 app 做一次 `--deep`。
+    expect(config.mac).toMatchObject({ identity: null, forceCodeSigning: false, notarize: false, target: ['dmg'] })
     expect(config.dmg).toMatchObject({ sign: false, writeUpdateInfo: false })
     // SSiD：官方让未签名产物不带更新元数据（`publish: null`）。思灵不买签名证书（构建恒为
     // unsigned），但仍要自动更新，所以未签名构建也写 feed 指向公开的 GitHub Releases ——
