@@ -51,5 +51,7 @@ it('accepts a stable prerelease in an unsigned Windows x64 configuration', () =>
     DSH_DESKTOP_UNSIGNED: '1',
   }, 'win32', 'x64')
   expect(config.extraMetadata).toMatchObject({ version })
-  expect(config.publish).toBeNull()
+  // SSiD：未签名构建没有 COS 凭据，`publish` 改指公开的 GitHub Releases 以保留自动更新
+  // （见 electron-builder-config.mjs 的 publish 分支）。上游此处断言 null。
+  expect(config.publish).toEqual([expect.objectContaining({ provider: 'github' })])
 })
